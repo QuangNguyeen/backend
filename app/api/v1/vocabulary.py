@@ -52,7 +52,10 @@ async def list_words(
     db: AsyncSession = Depends(get_db),
 ):
     """List all saved words for the current user."""
-    query = select(SavedWord).where(SavedWord.user_id == current_user.id)
+    query = select(SavedWord).where(
+        SavedWord.user_id == current_user.id,
+        SavedWord.deleted_at.is_(None),
+    )
     if video_id:
         query = query.where(SavedWord.video_id == video_id)
     query = query.order_by(SavedWord.created_at.desc()).limit(limit).offset(offset)
@@ -72,6 +75,7 @@ async def get_due_cards(
         select(SavedWord)
         .where(
             SavedWord.user_id == current_user.id,
+            SavedWord.deleted_at.is_(None),
             SavedWord.next_review_at <= now,
         )
         .order_by(SavedWord.next_review_at)
@@ -83,6 +87,7 @@ async def get_due_cards(
     count_result = await db.execute(
         select(func.count()).where(
             SavedWord.user_id == current_user.id,
+            SavedWord.deleted_at.is_(None),
             SavedWord.next_review_at <= now,
         )
     )
@@ -172,16 +177,17 @@ async def delete_word(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a saved word."""
+    """Soft delete a saved word (SRS 7.2.7)."""
     result = await db.execute(
         select(SavedWord).where(
             SavedWord.id == word_id,
             SavedWord.user_id == current_user.id,
+            SavedWord.deleted_at.is_(None),
         )
     )
     word = result.scalar_one_or_none()
     if not word:
         raise NotFoundError("Word not found")
 
-    await db.delete(word)
+    word.deleted_at = datetime.now(timezone.utc)
     await db.commit()

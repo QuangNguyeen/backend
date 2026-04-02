@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  # 1. NGINX REVERSE PROXY
+  nginx-proxy:
+    image: nginx:alpine
+    container_name: local_nginx
+    ports:
+      - "80:80"        # Frontend & API (via Nginx proxy)
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - local_net
+
+  # 2. JENKINS CI/CD SERVER
+  jenkins:
+    image: jenkins/jenkins:lts
+    container_name: local_jenkins
+    user: root
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - local_net
+
+  # 3. DATABASE
+  db:
+    image: postgres:15-alpine
+    container_name: local_db
+    environment:
+      POSTGRES_USER: postgres  # Xóa default phức tạp nếu làm local
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: dictalearn
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db_data:/var/lib/postgresql/data
+    networks:
+      - local_net
+
+  # 4. REDIS CACHE
+  redis:
+    image: redis:7-alpine
+    container_name: local_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - local_net
+
+  # 5. BACKEND (FastAPI - Không Publish port ra ngoài Host)
+  backend:
+    image: python:3.11
+    container_name: local_backend
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >
+      sh -c "pip install -r requirements.txt && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+    environment:
+      - DATABASE_URL=postgresql://postgres:secret@db:5432/dictalearn
+    depends_on:
+      - db
+
+  # 6. FRONTEND (React/Vite - Phải được API call trên Port 80)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    container_name: local_frontend
+    environment:
+      - VITE_API_URL=http://localhost/api  # Gọi qua Port 80 proxy Nginx
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - local_net
+
+networks:
+  local_net:
+    driver: bridge

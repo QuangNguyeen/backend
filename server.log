@@ -1,0 +1,9 @@
+INFO:     Will watch for changes in these directories: ['/Users/macbook/Documents/backend']
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [12190] using WatchFiles
+INFO:     Started server process [12195]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     127.0.0.1:58164 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58165 - "GET /api/v1/videos/transcript-languages/ps8qwWG8Uio HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58169 - "GET /api/v1/videos/transcript-languages/ps8qwWG8Uio HTTP/1.1" 200 OK

@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from app.api.deps import get_current_user
 from app.database import get_db
 from app.models.user import User
 from app.schemas.auth import (
@@ -24,9 +26,9 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
     user = User(
         email=body.email,
-        name=body.name,
-        hashed_password=hash_password(body.password),
-        language=body.language,
+        display_name=body.display_name,
+        password_hash=hash_password(body.password),
+        preferred_language=body.preferred_language,
     )
     db.add(user)
     await db.commit()
@@ -35,11 +37,14 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.email == body.email))
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.email == form_data.username))
     user = result.scalar_one_or_none()
 
-    if not user or not verify_password(body.password, user.hashed_password):
+    if not user or not verify_password(form_data.password, user.password_hash):
         raise UnauthorizedError("Invalid email or password")
 
     access_token = create_access_token({"sub": user.id})
@@ -59,5 +64,5 @@ async def refresh(body: RefreshRequest):
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_me(current_user: User = Depends(get_db)):
+async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
