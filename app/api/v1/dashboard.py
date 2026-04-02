@@ -5,7 +5,7 @@ from sqlalchemy import select, func
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
-from app.models.session import DictationSession, SentenceResult
+from app.models.dictation import DictationAttempt, DictationSentence
 from app.models.video import Video
 from app.schemas.dictation import DashboardStatsResponse, HistoryEntryResponse
 
@@ -17,34 +17,37 @@ async def get_stats(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Total sessions
+    # Total completed attempts
     result = await db.execute(
-        select(func.count()).where(DictationSession.user_id == current_user.id)
+        select(func.count()).where(
+            DictationAttempt.user_id == current_user.id,
+            DictationAttempt.status == "completed",
+        )
     )
     total_sessions = result.scalar() or 0
 
     # Average accuracy
     result = await db.execute(
-        select(func.avg(SentenceResult.score)).join(DictationSession).where(
-            DictationSession.user_id == current_user.id
-        )
+        select(func.avg(DictationSentence.score))
+        .join(DictationAttempt)
+        .where(DictationAttempt.user_id == current_user.id)
     )
     avg_accuracy = result.scalar() or 0.0
 
-    # Total videos
+    # Total videos practiced
     result = await db.execute(
-        select(func.count(func.distinct(DictationSession.video_id))).where(
-            DictationSession.user_id == current_user.id
+        select(func.count(func.distinct(DictationAttempt.video_id))).where(
+            DictationAttempt.user_id == current_user.id
         )
     )
     total_videos = result.scalar() or 0
 
     return DashboardStatsResponse(
         total_sessions=total_sessions,
-        total_time_minutes=0,  # TODO: compute from session durations
+        total_time_minutes=0,  # TODO: compute from duration_seconds
         average_accuracy=round(avg_accuracy * 100, 1),
         total_videos=total_videos,
-        streak=current_user.streak,
+        streak_days=current_user.streak_days,
     )
 
 
@@ -56,23 +59,26 @@ async def get_history(
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        select(DictationSession, Video.title)
-        .join(Video, DictationSession.video_id == Video.id)
-        .where(DictationSession.user_id == current_user.id)
-        .order_by(DictationSession.started_at.desc())
+        select(DictationAttempt, Video.title)
+        .join(Video, DictationAttempt.video_id == Video.id)
+        .where(
+            DictationAttempt.user_id == current_user.id,
+            DictationAttempt.status == "completed",
+        )
+        .order_by(DictationAttempt.completed_at.desc())
         .limit(limit)
         .offset(offset)
     )
 
     entries = []
-    for session, video_title in result.all():
+    for attempt, video_title in result.all():
         entries.append(HistoryEntryResponse(
-            id=session.id,
+            id=attempt.id,
             video_title=video_title,
             type="dictation",
-            score=round(session.score * 100, 1),
-            duration_minutes=0,  # TODO
-            completed_at=session.started_at.isoformat(),
+            score=round((attempt.score or 0) * 100, 1),
+            duration_minutes=0,  # TODO: compute from duration_seconds
+            completed_at=(attempt.completed_at or attempt.created_at).isoformat(),
         ))
 
     return entries

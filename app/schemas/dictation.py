@@ -10,7 +10,7 @@ class SubmitAnswerRequest(BaseModel):
 
 class WordDiffItem(BaseModel):
     word: str
-    status: str  # "correct" | "wrong" | "missing"
+    status: str  # "correct" | "wrong" | "missing" | "hinted" | "corrected" | "extra"
     expected: str | None = None
 
 
@@ -23,8 +23,8 @@ class SentenceResultResponse(BaseModel):
     missing_count: int
 
 
-class SessionResultResponse(BaseModel):
-    session_id: str
+class AttemptResultResponse(BaseModel):
+    attempt_id: str
     video_id: str
     total_score: float
     total_sentences: int
@@ -37,7 +37,7 @@ class DashboardStatsResponse(BaseModel):
     total_time_minutes: float
     average_accuracy: float
     total_videos: int
-    streak: int
+    streak_days: int
 
 
 class HistoryEntryResponse(BaseModel):

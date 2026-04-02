@@ -8,9 +8,9 @@ class LoginRequest(BaseModel):
 
 class RegisterRequest(BaseModel):
     email: EmailStr
-    name: str
+    display_name: str
     password: str
-    language: str = "en"
+    preferred_language: str = "en"
 
 
 class TokenResponse(BaseModel):
@@ -22,9 +22,9 @@ class TokenResponse(BaseModel):
 class UserResponse(BaseModel):
     id: str
     email: str
-    name: str
-    language: str
-    streak: int
+    display_name: str
+    preferred_language: str
+    streak_days: int
 
     model_config = {"from_attributes": True}
 

@@ -5,8 +5,8 @@ from sqlalchemy import select
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
-from app.models.session import DictationSession, SentenceResult
-from app.models.video import Sentence
+from app.models.dictation import DictationAttempt, DictationSentence
+from app.models.video import Transcript
 from app.schemas.dictation import SubmitAnswerRequest, SentenceResultResponse, WordDiffItem
 from app.services.dictation_service import compute_word_diff
 from app.core.exceptions import NotFoundError
@@ -17,28 +17,27 @@ router = APIRouter(prefix="/dictation", tags=["Dictation"])
 @router.post("/sessions", status_code=201)
 async def create_session(
     video_id: str,
-    mode: str = "intermediate",
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Count sentences
+    # Count transcripts (sentences)
     result = await db.execute(
-        select(Sentence).where(Sentence.video_id == video_id)
+        select(Transcript).where(Transcript.video_id == video_id)
     )
-    sentences = result.scalars().all()
-    if not sentences:
-        raise NotFoundError("No sentences found for this video")
+    transcripts = result.scalars().all()
+    if not transcripts:
+        raise NotFoundError("No transcripts found for this video")
 
-    session = DictationSession(
+    attempt = DictationAttempt(
         user_id=current_user.id,
         video_id=video_id,
-        mode=mode,
-        total_sentences=len(sentences),
+        status="in_progress",
+        total_sentences=len(transcripts),
     )
-    db.add(session)
+    db.add(attempt)
     await db.commit()
-    await db.refresh(session)
-    return {"session_id": session.id, "total_sentences": session.total_sentences}
+    await db.refresh(attempt)
+    return {"session_id": attempt.id, "total_sentences": attempt.total_sentences}
 
 
 @router.post("/sessions/{session_id}/submit", response_model=SentenceResultResponse)
@@ -48,50 +47,50 @@ async def submit_answer(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Get session
+    # Get attempt
     result = await db.execute(
-        select(DictationSession).where(
-            DictationSession.id == session_id,
-            DictationSession.user_id == current_user.id,
+        select(DictationAttempt).where(
+            DictationAttempt.id == session_id,
+            DictationAttempt.user_id == current_user.id,
         )
     )
-    session = result.scalar_one_or_none()
-    if not session:
+    attempt = result.scalar_one_or_none()
+    if not attempt:
         raise NotFoundError("Session not found")
 
-    # Get correct sentence
+    # Get correct transcript segment
     result = await db.execute(
-        select(Sentence).where(
-            Sentence.video_id == session.video_id,
-            Sentence.index == body.sentence_index,
+        select(Transcript).where(
+            Transcript.video_id == attempt.video_id,
+            Transcript.index == body.sentence_index,
         )
     )
-    sentence = result.scalar_one_or_none()
-    if not sentence:
-        raise NotFoundError("Sentence not found")
+    transcript = result.scalar_one_or_none()
+    if not transcript:
+        raise NotFoundError("Transcript segment not found")
 
     # Compute word diff
-    diffs, score = compute_word_diff(body.user_input, sentence.text)
+    diffs, score = compute_word_diff(body.user_input, transcript.text)
 
     # Apply hint penalty
     hint_penalty = body.hints_used * 0.05
     final_score = max(0, score - hint_penalty)
 
     # Save result
-    sentence_result = SentenceResult(
-        session_id=session_id,
+    dictation_sentence = DictationSentence(
+        attempt_id=session_id,
         sentence_index=body.sentence_index,
         user_input=body.user_input,
-        correct_text=sentence.text,
+        original_text=transcript.text,
         score=final_score,
-        word_diffs=[d.model_dump() for d in diffs],
+        word_diff=[d.model_dump() for d in diffs],
         hints_used=body.hints_used,
         replay_count=body.replay_count,
     )
-    db.add(sentence_result)
+    db.add(dictation_sentence)
 
-    # Update session progress
-    session.current_index = body.sentence_index + 1
+    # Update attempt progress
+    attempt.current_sentence_index = body.sentence_index + 1
     await db.commit()
 
     correct = sum(1 for d in diffs if d.status == "correct")
