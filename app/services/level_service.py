@@ -239,6 +239,69 @@ def analyze_level(text: str, language: str = "en") -> str:
         return "A2"
 
 
+# ─── BR-02.5 / BR-02.6: FK Grade + Speech Rate CEFR estimation ──────────────
+
+_FK_CEFR_MAP = ["A1", "A2", "B1", "B2"]  # index 0–3
+_FK_GRADE_BREAKS = [4, 6, 9]  # grade <4→A1, <6→A2, <9→B1, ≥9→B2
+
+
+def _fk_grade_to_cefr_index(grade: float) -> int:
+    """Map Flesch-Kincaid Grade Level to a 0–3 CEFR index."""
+    for i, brk in enumerate(_FK_GRADE_BREAKS):
+        if grade < brk:
+            return i
+    return 3  # B2
+
+
+def _wpm_adjust(cefr_idx: int, wpm: float) -> int:
+    """Shift CEFR index by speech rate: slow → -1, fast → +1."""
+    if wpm < 100:
+        return max(0, cefr_idx - 1)
+    if wpm > 140:
+        return min(3, cefr_idx + 1)
+    return cefr_idx
+
+
+def estimate_cefr_with_speech_rate(
+    text: str,
+    duration_seconds: float,
+    language: str = "en",
+) -> str:
+    """Estimate CEFR using Flesch-Kincaid readability + WPM adjustment.
+
+    BR-02.5: FK Grade → CEFR base level (English only).
+    BR-02.6: WPM adjustment (±1 level).
+
+    Returns a clean CEFR string like "B1".
+    """
+    if language != "en" or not text or len(text.split()) < 10:
+        # Fall back to the spaCy-based analyzer for non-English
+        return analyze_level(text, language=language)
+
+    try:
+        import textstat
+
+        grade = textstat.flesch_kincaid_grade(text)
+        base_idx = _fk_grade_to_cefr_index(grade)
+
+        # Speech rate adjustment
+        words = text.split()
+        duration_min = max(duration_seconds / 60.0, 0.1)
+        wpm = len(words) / duration_min
+        final_idx = _wpm_adjust(base_idx, wpm)
+
+        level = _FK_CEFR_MAP[final_idx]
+        logger.info(
+            "CEFR estimation: FK_grade=%.1f base=%s wpm=%.0f final=%s",
+            grade, _FK_CEFR_MAP[base_idx], wpm, level,
+        )
+        return level
+
+    except Exception:
+        logger.exception("CEFR estimation failed, falling back to spaCy")
+        return analyze_level(text, language=language)
+
+
 def analyze_level_detailed(text: str, language: str = "en") -> dict:
     """Like analyze_level but returns the full feature breakdown.
 

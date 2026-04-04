@@ -19,6 +19,8 @@ class VideoResponse(BaseModel):
     is_curated: bool
     is_active: bool
     thumbnail_url: str
+    play_count: int = 0
+    best_score: float | None = None
 
     model_config = {"from_attributes": True}
 
@@ -49,6 +51,17 @@ class ImportVideoRequest(BaseModel):
             ]
         }
     }
+
+
+class ImportPartialResponse(BaseModel):
+    """Returned when metadata was fetched but transcript extraction failed."""
+    status: str = "partial"
+    video_id: str
+    title: str
+    channel: str
+    thumbnail_url: str
+    duration: int
+    message: str
 
 
 class TranscriptResponse(BaseModel):
