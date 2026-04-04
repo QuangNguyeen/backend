@@ -1,7 +1,7 @@
 import logging
 
 from fastapi import APIRouter, Depends, Response
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
@@ -11,14 +11,17 @@ from app.models.dictation import DictationAttempt, DictationSentence
 from app.models.user import User
 from app.models.video import Transcript, Video
 from app.schemas.video import (
+    ImportPartialResponse,
     ImportVideoRequest,
     LevelAnalysisResponse,
     TranscriptResponse,
     TranscriptLanguageResponse,
     VideoResponse,
 )
+from youtube_transcript_api._errors import TranscriptsDisabled, VideoUnavailable
+
 from app.services import youtube_service
-from app.services.level_service import analyze_level
+from app.services.level_service import analyze_level, estimate_cefr_with_speech_rate
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +35,26 @@ async def list_videos(
     curated: bool | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(Video).where(Video.is_active == True)  # noqa: E712
+    # Subquery for play_count and best_score per video
+    stats_sub = (
+        select(
+            DictationAttempt.video_id,
+            func.count().filter(DictationAttempt.status == "completed").label("play_count"),
+            func.max(DictationAttempt.score).label("best_score"),
+        )
+        .group_by(DictationAttempt.video_id)
+        .subquery()
+    )
+
+    query = (
+        select(
+            Video,
+            func.coalesce(stats_sub.c.play_count, 0).label("play_count"),
+            stats_sub.c.best_score,
+        )
+        .outerjoin(stats_sub, Video.id == stats_sub.c.video_id)
+        .where(Video.is_active == True)  # noqa: E712
+    )
     if language:
         query = query.where(Video.language == language)
     if level:
@@ -41,16 +63,26 @@ async def list_videos(
         query = query.where(Video.is_curated == curated)
 
     result = await db.execute(query.order_by(Video.created_at.desc()))
-    return result.scalars().all()
+    videos = []
+    for row in result.all():
+        video = row[0]
+        resp = VideoResponse.model_validate(video)
+        resp.play_count = row[1] or 0
+        resp.best_score = round(row[2] * 100, 1) if row[2] is not None else None
+        videos.append(resp)
+    return videos
 
 
-@router.post("/import", response_model=VideoResponse, status_code=201)
+@router.post("/import", response_model=VideoResponse, status_code=201,
+              responses={206: {"model": ImportPartialResponse}})
 async def import_video(
     body: ImportVideoRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Import a YouTube video and extract its transcript for dictation practice."""
+    from fastapi.responses import JSONResponse
+
     # Extract video ID from URL
     video_id = youtube_service.extract_video_id(body.youtube_url)
 
@@ -61,47 +93,99 @@ async def import_video(
     if existing.scalar_one_or_none():
         raise ConflictError(f"Video {video_id} already imported")
 
-    # Auto-fetch metadata from YouTube if not provided manually
+    # ── Phase 1: External API calls (no DB writes) ─────────────────────────
+
+    # 1. Metadata (oEmbed → yt-dlp → defaults)
     metadata = {"title": "", "channel": "", "duration": 0, "thumbnail_url": ""}
     if not body.title or not body.channel:
         try:
             metadata = youtube_service.get_video_metadata(video_id)
-        except (NotFoundError, BadRequestError):
-            logger.warning("Failed to fetch metadata for video %s, using defaults", video_id)
+        except Exception as e:
+            logger.error("Metadata fetch failed for %s: %s", video_id, e, exc_info=True)
 
-    # Get transcript
-    segments = youtube_service.get_transcript(video_id, languages=body.languages)
+    resolved_title = body.title or metadata.get("title") or f"YouTube Video {video_id}"
+    resolved_thumbnail = metadata.get("thumbnail_url") or f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
-    # Merge segments using smart sentence-boundary-aware algorithm
+    # 2. Transcript — Layer 1: youtube-transcript-api
+    segments = None
+    transcript_error = None
+
+    try:
+        segments = youtube_service.get_transcript(video_id, languages=body.languages)
+        logger.info("Transcript for %s fetched via youtube-transcript-api", video_id)
+    except TranscriptsDisabled as e:
+        logger.error("Layer 1 failed — TranscriptsDisabled for %s: %s", video_id, e)
+        transcript_error = e
+    except VideoUnavailable as e:
+        logger.error("Layer 1 failed — VideoUnavailable for %s: %s", video_id, e)
+        raise NotFoundError(f"Video '{video_id}' is unavailable or has been removed.")
+    except Exception as e:
+        logger.error("Layer 1 failed — %s for %s: %s", type(e).__name__, video_id, e, exc_info=True)
+        transcript_error = e
+
+    # 2b. Transcript — Layer 2: yt-dlp --write-auto-subs
+    if segments is None:
+        logger.info("Attempting yt-dlp subtitle fallback for %s", video_id)
+        try:
+            segments = youtube_service.get_transcript_ytdlp(video_id, languages=body.languages)
+            transcript_error = None
+        except Exception as e:
+            logger.error("Layer 2 failed — yt-dlp subtitle fallback for %s: %s", video_id, e, exc_info=True)
+            transcript_error = transcript_error or e
+
+    # 2c. All transcript layers failed → return partial response (no DB rollback)
+    if segments is None:
+        return JSONResponse(
+            status_code=206,
+            content=ImportPartialResponse(
+                video_id=video_id,
+                title=resolved_title,
+                channel=body.channel or metadata.get("channel", ""),
+                thumbnail_url=resolved_thumbnail,
+                duration=metadata.get("duration", 0),
+                message=(
+                    f"Metadata fetched successfully, but transcript extraction is currently blocked. "
+                    f"Reason: {type(transcript_error).__name__}: {transcript_error}. "
+                    f"Please try again later."
+                ),
+            ).model_dump(),
+        )
+
+    # 3. Merge & analyze (pure computation, no network)
     merged_segments = youtube_service.merge_segments_smart(
         segments, max_duration=body.max_segment_duration
     )
 
-    # Auto-detect CEFR level from transcript text when not explicitly provided
+    video_duration = metadata.get("duration") or (int(merged_segments[-1].end) if merged_segments else 0)
     if body.level:
         detected_level = body.level
     else:
         full_text = youtube_service.get_full_text(segments)
-        detected_level = analyze_level(full_text, language=body.language)
+        if body.language == "en" and video_duration > 0:
+            detected_level = estimate_cefr_with_speech_rate(
+                full_text, duration_seconds=video_duration, language=body.language,
+            )
+        else:
+            detected_level = analyze_level(full_text, language=body.language)
         logger.info("Auto-detected level for video %s: %s", video_id, detected_level)
 
-    # Create video record
+    # ── Phase 2: Database writes (all external data ready) ────────────────
+
     video = Video(
         youtube_id=video_id,
-        title=body.title or metadata.get("title") or f"YouTube Video {video_id}",
+        title=resolved_title,
         channel=body.channel or metadata.get("channel", ""),
-        duration=metadata.get("duration") or (int(merged_segments[-1].end) if merged_segments else 0),
+        duration=video_duration,
         language=body.language,
         level=detected_level,
         is_curated=False,
         is_active=True,
-        thumbnail_url=metadata.get("thumbnail_url") or f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+        thumbnail_url=resolved_thumbnail,
         created_by=current_user.id,
     )
     db.add(video)
-    await db.flush()  # Get video.id
+    await db.flush()
 
-    # Create transcript records
     for idx, segment in enumerate(merged_segments):
         transcript = Transcript(
             video_id=video.id,
@@ -222,10 +306,9 @@ async def refresh_transcript(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Re-fetch transcript from YouTube and rebuild transcript segments.
+    """Re-fetch metadata and transcript from YouTube.
 
-    This keeps the video record but replaces all transcripts with
-    freshly fetched and merged transcript data.
+    Updates title, channel, thumbnail, duration, transcripts, and CEFR level.
     """
     result = await db.execute(select(Video).where(Video.id == video_id))
     video = result.scalar_one_or_none()
@@ -235,13 +318,29 @@ async def refresh_transcript(
     if video.created_by != current_user.id:
         raise ForbiddenError("You can only refresh videos you created")
 
+    # Re-fetch metadata (never raises)
+    metadata = youtube_service.get_video_metadata(video.youtube_id)
+    if metadata.get("title"):
+        video.title = metadata["title"]
+    if metadata.get("channel"):
+        video.channel = metadata["channel"]
+    if metadata.get("thumbnail_url"):
+        video.thumbnail_url = metadata["thumbnail_url"]
+    if metadata.get("duration"):
+        video.duration = metadata["duration"]
+
     # Delete old transcripts
     await db.execute(
         delete(Transcript).where(Transcript.video_id == video_id)
     )
 
     # Re-fetch transcript from YouTube
-    segments = youtube_service.get_transcript(video.youtube_id)
+    try:
+        segments = youtube_service.get_transcript(video.youtube_id)
+    except TranscriptsDisabled:
+        raise BadRequestError(f"Transcripts are disabled for video: {video.youtube_id}")
+    except VideoUnavailable:
+        raise NotFoundError(f"Video '{video.youtube_id}' is unavailable or has been removed.")
 
     # Merge with smart algorithm
     merged_segments = youtube_service.merge_segments_smart(
@@ -260,11 +359,19 @@ async def refresh_transcript(
         )
         db.add(transcript)
 
-    # Update video duration and re-analyze level from fresh transcript
-    if merged_segments:
+    # Update duration from transcript if metadata didn't provide it
+    if merged_segments and not video.duration:
         video.duration = int(merged_segments[-1].end)
+
+    # Re-analyze CEFR level
+    if merged_segments:
         full_text = youtube_service.get_full_text(segments)
-        video.level = analyze_level(full_text, language=video.language)
+        if video.language == "en" and video.duration > 0:
+            video.level = estimate_cefr_with_speech_rate(
+                full_text, duration_seconds=video.duration, language=video.language,
+            )
+        else:
+            video.level = analyze_level(full_text, language=video.language)
         logger.info("Re-analyzed level for video %s: %s", video_id, video.level)
 
     await db.commit()

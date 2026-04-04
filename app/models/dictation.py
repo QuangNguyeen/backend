@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, Integer, Float, Text, DateTime, ForeignKey, Index, JSON, func
+from sqlalchemy import String, Integer, Float, Text, DateTime, ForeignKey, Index, JSON, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -33,6 +33,7 @@ class DictationAttempt(Base):
     )
 
     __table_args__ = (
+        UniqueConstraint("user_id", "video_id", name="uq_attempts_user_video"),
         Index("idx_attempts_user_completed", "user_id", "status"),
         Index("idx_attempts_user_in_progress", "user_id", "current_sentence_index"),
     )

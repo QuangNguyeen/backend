@@ -211,3 +211,31 @@ def _score_to_cefr(score: float) -> str:
         return "C1"
     else:
         return "C2"
+
+
+def get_word_difficulty_map(text: str, language: str = "en") -> dict[str, float]:
+    """Return per-word difficulty scores for a sentence.
+
+    Score range: 0.0 (very common) → 1.0 (very rare/hard).
+    Uses zipf frequency: zipf >= 6 → common (score ≈ 0), zipf <= 3 → rare (score ≈ 1).
+    Frontend should highlight words with score >= 0.6 as "difficult".
+
+    Args:
+        text: The sentence to analyze.
+        language: BCP-47 language code (default 'en').
+
+    Returns:
+        Dict mapping lowercase word → difficulty score (0.0–1.0).
+    """
+    import re
+
+    EASY_ZIPF = 6.0   # very common words (the, is, go)
+    HARD_ZIPF = 3.0   # rare words (ephemeral, juxtaposition)
+
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    result: dict[str, float] = {}
+    for word in set(words):
+        zipf = zipf_frequency(word, language)
+        difficulty = round(max(0.0, min(1.0, (EASY_ZIPF - zipf) / (EASY_ZIPF - HARD_ZIPF))), 2)
+        result[word] = difficulty
+    return result
