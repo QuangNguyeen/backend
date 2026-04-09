@@ -20,4 +20,4 @@ dist/
 # OS
 .DS_Store
 
-.db_data/
+db_data/
