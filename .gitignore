@@ -21,3 +21,6 @@ dist/
 .DS_Store
 
 .db_data/
+.scripts/
+task.md
+.claude
