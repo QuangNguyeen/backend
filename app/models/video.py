@@ -19,6 +19,7 @@ class Video(Base):
     level: Mapped[str | None] = mapped_column(String(5), nullable=True)
     is_curated: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_auto_generated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     thumbnail_url: Mapped[str] = mapped_column(String(500), default="")
     created_by: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

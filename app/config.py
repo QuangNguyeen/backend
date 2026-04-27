@@ -1,5 +1,9 @@
-from pydantic_settings import BaseSettings
+from pathlib import Path
 from functools import lru_cache
+
+from pydantic_settings import BaseSettings
+
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -23,7 +27,13 @@ class Settings(BaseSettings):
     # YouTube
     YOUTUBE_API_KEY: str = ""
 
-    model_config = {"env_file": ".env", "extra": "ignore"}
+    # Gemini
+    GEMINI_API_KEY: str = ""
+
+    # Google Cloud (Translation API)
+    GOOGLE_APPLICATION_CREDENTIALS: str = ""
+
+    model_config = {"env_file": str(_ENV_FILE), "extra": "ignore"}
 
 
 @lru_cache

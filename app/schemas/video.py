@@ -18,6 +18,7 @@ class VideoResponse(BaseModel):
     level: str | None
     is_curated: bool
     is_active: bool
+    is_auto_generated: bool = False
     thumbnail_url: str
     play_count: int = 0
     best_score: float | None = None
@@ -80,3 +81,21 @@ class TranscriptLanguageResponse(BaseModel):
     language_code: str
     is_generated: bool
     is_translatable: bool
+
+
+class TranscriptUpdateItem(BaseModel):
+    transcript_id: str = Field(..., description="ID of the transcript row to update")
+    text: str = Field("", description="New subtitle text (ignored when is_deleted=True)")
+    is_deleted: bool = Field(False, description="When True, delete this transcript row")
+
+
+class TranscriptBulkUpdateRequest(BaseModel):
+    items: list[TranscriptUpdateItem] = Field(..., min_length=1)
+
+
+class TranscriptBulkUpdateResponse(BaseModel):
+    updated: int
+
+
+class VideoEditStatusResponse(BaseModel):
+    has_in_progress_attempt: bool

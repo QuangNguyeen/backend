@@ -20,6 +20,12 @@ class SavedWord(Base):
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(String(20), default="dictation")
 
+    # Enrichment fields
+    phonetic: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    audio_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    context_translation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    part_of_speech: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
     # SM-2 SRS fields
     ease_factor: Mapped[float] = mapped_column(Float, default=2.5)
     interval_days: Mapped[int] = mapped_column(Integer, default=0)
