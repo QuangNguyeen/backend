@@ -15,6 +15,7 @@ class DictationAttempt(Base):
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     video_id: Mapped[str] = mapped_column(String(36), ForeignKey("videos.id"), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="in_progress")
+    practice_mode: Mapped[str] = mapped_column(String(20), default="sentence", nullable=False)
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
     total_sentences: Mapped[int | None] = mapped_column(Integer, nullable=True)
     current_sentence_index: Mapped[int] = mapped_column(Integer, default=0)

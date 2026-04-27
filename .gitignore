@@ -20,4 +20,7 @@ dist/
 # OS
 .DS_Store
 
-db_data/
+.db_data/
+.scripts/
+task.md
+.claude

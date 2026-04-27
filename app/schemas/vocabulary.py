@@ -10,6 +10,10 @@ class SaveWordRequest(BaseModel):
     meaning: str | None = None
     note: str | None = None
     source: str = "dictation"
+    audio_url: str | None = None
+    phonetic: str | None = None
+    context_translation: str | None = None
+    part_of_speech: str | None = None
 
 
 class UpdateWordRequest(BaseModel):
@@ -36,6 +40,10 @@ class SavedWordResponse(BaseModel):
     next_review_at: datetime | None
     last_reviewed_at: datetime | None
     created_at: datetime
+    phonetic: str | None = None
+    audio_url: str | None = None
+    context_translation: str | None = None
+    part_of_speech: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -55,6 +63,10 @@ class FlashCardResponse(BaseModel):
     audio_start_time: float | None
     video_id: str | None
     meaning: str | None
+    phonetic: str | None = None
+    audio_url: str | None = None
+    context_translation: str | None = None
+    part_of_speech: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -62,3 +74,13 @@ class FlashCardResponse(BaseModel):
 class DueCardsResponse(BaseModel):
     cards: list[FlashCardResponse]
     total_due: int
+
+
+class WordPreviewResponse(BaseModel):
+    word: str
+    phonetic: str | None = None
+    meaning: str | None = None
+    audio_url: str | None = None
+    context_translation: str | None = None
+    is_saved: bool = False
+    part_of_speech: str | None = None

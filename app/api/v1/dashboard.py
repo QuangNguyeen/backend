@@ -17,43 +17,11 @@ from app.schemas.dictation import (
     AccuracyPoint,
     HistoryEntryResponse,
 )
+from app.services.stats_service import compute_streaks
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
-
-
-def _compute_streaks(active_dates: set[date], today: date) -> tuple[int, int]:
-    """Compute current and longest streaks from a set of active dates."""
-    if not active_dates:
-        return 0, 0
-
-    sorted_dates = sorted(active_dates)
-
-    # Longest streak
-    longest = 1
-    current_run = 1
-    for i in range(1, len(sorted_dates)):
-        if sorted_dates[i] - sorted_dates[i - 1] == timedelta(days=1):
-            current_run += 1
-            longest = max(longest, current_run)
-        else:
-            current_run = 1
-
-    # Current streak (counting backwards from today)
-    current_streak = 0
-    d = today
-    while d in active_dates:
-        current_streak += 1
-        d -= timedelta(days=1)
-    # If user hasn't practiced today, check from yesterday
-    if current_streak == 0:
-        d = today - timedelta(days=1)
-        while d in active_dates:
-            current_streak += 1
-            d -= timedelta(days=1)
-
-    return current_streak, longest
 
 
 def _count_to_level(count: int) -> int:
@@ -143,7 +111,7 @@ async def get_dashboard(
     # ── Streaks ──────────────────────────────────────────────────────────────
 
     active_dates = set(day_counts.keys())
-    current_streak, longest_streak = _compute_streaks(active_dates, today)
+    current_streak, longest_streak = compute_streaks(active_dates, today)
 
     # ── Accuracy trend (last 20 completed sessions, chronological) ───────────
 

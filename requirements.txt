@@ -1,0 +1,40 @@
+# Web framework
+fastapi==0.135.1
+uvicorn[standard]==0.41.0
+python-multipart==0.0.22
+
+# Database
+SQLAlchemy[asyncio]==2.0.47
+asyncpg==0.31.0
+alembic==1.18.4
+
+# Settings & validation
+pydantic==2.12.5
+pydantic-settings==2.13.1
+email-validator==2.3.0
+
+# Auth
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+
+# HTTP clients
+httpx==0.28.1
+requests==2.32.5
+
+# YouTube
+youtube-transcript-api==1.2.4
+yt-dlp==2026.3.17
+
+# NLP / text analysis
+spacy==3.8.13
+wordfreq==3.1.1
+
+# Text-to-Speech fallback
+edge-tts>=6.1.0
+
+# Translation fallback
+deep-translator>=1.11.0
+
+# LLM
+google-genai>=1.0.0

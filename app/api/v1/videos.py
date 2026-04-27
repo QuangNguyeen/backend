@@ -2,6 +2,7 @@ import logging
 
 from fastapi import APIRouter, Depends, Response
 from sqlalchemy import delete, select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
@@ -14,18 +15,101 @@ from app.schemas.video import (
     ImportPartialResponse,
     ImportVideoRequest,
     LevelAnalysisResponse,
+    TranscriptBulkUpdateRequest,
+    TranscriptBulkUpdateResponse,
     TranscriptResponse,
     TranscriptLanguageResponse,
+    VideoEditStatusResponse,
     VideoResponse,
 )
 from youtube_transcript_api._errors import TranscriptsDisabled, VideoUnavailable
 
 from app.services import youtube_service
 from app.services.level_service import analyze_level, estimate_cefr_with_speech_rate
+from app.services.llm_service import punctuate_transcript
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/videos", tags=["Videos"])
+
+
+def _redistribute_punctuated_text(
+    punctuated_text: str,
+    original_segments: list[youtube_service.TranscriptSegment],
+) -> list[youtube_service.TranscriptSegment]:
+    """Map Gemini-punctuated text back onto original segment timestamps.
+
+    Strategy: Instead of rigid per-segment word mapping, we use a
+    proportional approach. We calculate the overall word-position ratio
+    and map each punctuated word back to the closest original segment's
+    time range. This tolerates word-count drift from Gemini without
+    losing segments or creating time gaps.
+    """
+    if not original_segments or not punctuated_text.strip():
+        return original_segments
+
+    punct_words = punctuated_text.split()
+    total_punct_words = len(punct_words)
+    if total_punct_words == 0:
+        return original_segments
+
+    word_timestamps: list[tuple[float, float]] = []
+    for seg in original_segments:
+        seg_wc = len(seg.text.split())
+        if seg_wc == 0:
+            continue
+        word_duration = seg.duration / seg_wc
+        for w_idx in range(seg_wc):
+            w_start = seg.start + w_idx * word_duration
+            w_end = w_start + word_duration
+            word_timestamps.append((w_start, w_end))
+
+    total_orig_words = len(word_timestamps)
+    if total_orig_words == 0:
+        return original_segments
+
+    result_segments: list[youtube_service.TranscriptSegment] = []
+    current_words: list[str] = []
+    current_start: float | None = None
+    current_end: float = 0.0
+
+    for p_idx, word in enumerate(punct_words):
+        orig_idx = int(p_idx * total_orig_words / total_punct_words)
+        orig_idx = min(orig_idx, total_orig_words - 1)
+
+        w_start, w_end = word_timestamps[orig_idx]
+
+        if current_start is None:
+            current_start = w_start
+
+        current_words.append(word)
+        current_end = w_end
+
+        stripped = word.rstrip()
+        if stripped and stripped[-1] in ".?!":
+            result_segments.append(youtube_service.TranscriptSegment(
+                text=" ".join(current_words),
+                start=current_start,
+                duration=current_end - current_start,
+            ))
+            current_words = []
+            current_start = None
+
+    if current_words and current_start is not None:
+        result_segments.append(youtube_service.TranscriptSegment(
+            text=" ".join(current_words),
+            start=current_start,
+            duration=current_end - current_start,
+        ))
+
+    if not result_segments:
+        return original_segments
+
+    logger.warning(
+        "Redistributed punctuated text: %d orig segments → %d sentences",
+        len(original_segments), len(result_segments),
+    )
+    return result_segments
 
 
 @router.get("", response_model=list[VideoResponse])
@@ -171,6 +255,75 @@ async def import_video(
 
     # ── Phase 2: Database writes (all external data ready) ────────────────
 
+    # Detect auto-generated subs by punctuation density.
+    # Auto-gen YouTube subs almost never include sentence punctuation; manually-uploaded subs do.
+    sentence_punct = (".", "?", "!")
+    if merged_segments:
+        with_punct = sum(
+            1 for seg in merged_segments
+            if any(c in seg.text for c in sentence_punct)
+        )
+        is_auto_generated = (with_punct / len(merged_segments)) < 0.30
+        logger.warning(
+            "Import auto-gen detection for %s: %d/%d segments with punct → is_auto=%s",
+            video_id, with_punct, len(merged_segments), is_auto_generated,
+        )
+    else:
+        is_auto_generated = False
+
+    MAX_AUTO_GEN_DURATION = 300
+    if is_auto_generated and video_duration > MAX_AUTO_GEN_DURATION:
+        raise BadRequestError(
+            f"Videos with auto-generated subtitles are limited to "
+            f"{MAX_AUTO_GEN_DURATION // 60} minutes. "
+            f"This video is {video_duration // 60}m {video_duration % 60}s. "
+            f"Please choose a shorter video or one with manually uploaded subtitles."
+        )
+
+    # Punctuate auto-generated subs via Gemini (best-effort).
+    # Uses original un-merged segments for finest-grained timestamp alignment.
+    if is_auto_generated and segments:
+        try:
+            full_raw_text = " ".join(seg.text for seg in segments)
+            logger.warning(
+                "Auto-generated subs detected for %s, calling Gemini punctuation (%d words)…",
+                video_id, len(full_raw_text.split()),
+            )
+            punctuated_text = await punctuate_transcript(
+                full_raw_text, language=body.language
+            )
+            if punctuated_text:
+                punctuated_segments = _redistribute_punctuated_text(
+                    punctuated_text, segments
+                )
+                merged_segments = youtube_service.merge_segments_smart(
+                    punctuated_segments, max_duration=body.max_segment_duration
+                )
+                logger.warning(
+                    "Punctuated auto-generated subs for %s via Gemini "
+                    "(%d raw segments → %d punctuated sentences → %d merged chunks)",
+                    video_id,
+                    len(segments),
+                    len(punctuated_segments),
+                    len(merged_segments),
+                )
+                for i, seg in enumerate(merged_segments[:3]):
+                    logger.warning(
+                        "  Chunk %d: [%.1f–%.1f] %s",
+                        i, seg.start, seg.end,
+                        seg.text[:80] + ("…" if len(seg.text) > 80 else ""),
+                    )
+            else:
+                logger.warning(
+                    "Gemini punctuation returned None for %s, using raw text",
+                    video_id,
+                )
+        except Exception as e:
+            logger.warning(
+                "Punctuation enrichment failed for %s, using raw text: %s",
+                video_id, e,
+            )
+
     video = Video(
         youtube_id=video_id,
         title=resolved_title,
@@ -180,11 +333,16 @@ async def import_video(
         level=detected_level,
         is_curated=False,
         is_active=True,
+        is_auto_generated=is_auto_generated,
         thumbnail_url=resolved_thumbnail,
         created_by=current_user.id,
     )
     db.add(video)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise ConflictError(f"Video {video_id} already imported")
 
     for idx, segment in enumerate(merged_segments):
         transcript = Transcript(
@@ -225,6 +383,69 @@ async def get_transcripts(video_id: str, db: AsyncSession = Depends(get_db)):
         select(Transcript).where(Transcript.video_id == video_id).order_by(Transcript.index)
     )
     return result.scalars().all()
+
+
+@router.put("/{video_id}/transcripts", response_model=TranscriptBulkUpdateResponse)
+async def bulk_update_transcripts(
+    video_id: str,
+    body: TranscriptBulkUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bulk-update transcript text for a video (owner only).
+
+    All updates commit as one transaction. Any unknown transcript_id or row
+    belonging to a different video aborts the whole request with 404.
+    """
+    video = (await db.execute(select(Video).where(Video.id == video_id))).scalar_one_or_none()
+    if not video:
+        raise NotFoundError("Video not found")
+    if video.created_by != current_user.id:
+        raise ForbiddenError("You can only edit subtitles of videos you created")
+
+    ids = [item.transcript_id for item in body.items]
+    rows = (await db.execute(
+        select(Transcript).where(Transcript.id.in_(ids))
+    )).scalars().all()
+    rows_by_id = {r.id: r for r in rows}
+
+    deleted = 0
+    updated = 0
+    for item in body.items:
+        row = rows_by_id.get(item.transcript_id)
+        if not row or row.video_id != video_id:
+            raise NotFoundError(f"Transcript {item.transcript_id} not found for this video")
+        if item.is_deleted:
+            await db.delete(row)
+            deleted += 1
+        else:
+            if item.text:
+                row.text = item.text
+                updated += 1
+
+    await db.commit()
+    return TranscriptBulkUpdateResponse(updated=updated + deleted)
+
+
+@router.get("/{video_id}/edit-status", response_model=VideoEditStatusResponse)
+async def get_video_edit_status(
+    video_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Flags whether the current user has an in-progress DictationAttempt on this
+    video, so the UI can warn before editing subtitles may alter past scoring."""
+    video = (await db.execute(select(Video).where(Video.id == video_id))).scalar_one_or_none()
+    if not video:
+        raise NotFoundError("Video not found")
+
+    exists_q = select(DictationAttempt.id).where(
+        DictationAttempt.user_id == current_user.id,
+        DictationAttempt.video_id == video_id,
+        DictationAttempt.status == "in_progress",
+    ).limit(1)
+    in_progress = (await db.execute(exists_q)).scalar_one_or_none() is not None
+    return VideoEditStatusResponse(has_in_progress_attempt=in_progress)
 
 
 @router.post("/{video_id}/analyze-level", response_model=LevelAnalysisResponse)
@@ -346,6 +567,62 @@ async def refresh_transcript(
     merged_segments = youtube_service.merge_segments_smart(
         segments, max_duration=max_segment_duration
     )
+
+    # Detect auto-generated subs and punctuate if needed
+    sentence_punct = (".", "?", "!")
+    if merged_segments:
+        with_punct = sum(
+            1 for seg in merged_segments
+            if any(c in seg.text for c in sentence_punct)
+        )
+        refresh_is_auto = (with_punct / len(merged_segments)) < 0.30
+        logger.warning(
+            "Refresh auto-gen detection for %s: %d/%d segments with punct → is_auto=%s",
+            video_id, with_punct, len(merged_segments), refresh_is_auto,
+        )
+    else:
+        refresh_is_auto = False
+    video.is_auto_generated = refresh_is_auto
+
+    MAX_AUTO_GEN_DURATION = 300
+    if refresh_is_auto and video.duration and video.duration > MAX_AUTO_GEN_DURATION:
+        raise BadRequestError(
+            f"Videos with auto-generated subtitles are limited to "
+            f"{MAX_AUTO_GEN_DURATION // 60} minutes. "
+            f"This video is {video.duration // 60}m {video.duration % 60}s. "
+            f"Please choose a shorter video or one with manually uploaded subtitles."
+        )
+
+    if refresh_is_auto and segments:
+        try:
+            full_raw_text = " ".join(seg.text for seg in segments)
+            logger.warning(
+                "Auto-generated subs detected on refresh for %s, calling Gemini punctuation…",
+                video_id,
+            )
+            punctuated_text = await punctuate_transcript(
+                full_raw_text, language=video.language
+            )
+            if punctuated_text:
+                punctuated_segments = _redistribute_punctuated_text(
+                    punctuated_text, segments
+                )
+                merged_segments = youtube_service.merge_segments_smart(
+                    punctuated_segments, max_duration=max_segment_duration
+                )
+                logger.warning(
+                    "Punctuated refreshed subs for %s via Gemini (%d segments)",
+                    video.id, len(merged_segments),
+                )
+            else:
+                logger.warning(
+                    "Gemini punctuation returned None on refresh for %s, using raw text",
+                    video_id,
+                )
+        except Exception as e:
+            logger.warning(
+                "Punctuation enrichment failed on refresh for %s: %s", video_id, e,
+            )
 
     # Create new transcript records
     for idx, segment in enumerate(merged_segments):

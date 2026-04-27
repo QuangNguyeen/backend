@@ -1,0 +1,71 @@
+
+subtitles_output.txt
+# Subtitles output
+
+server.log
+# Server logs
+
+nginx/ssl/*.key
+nginx/ssl/*.crt
+nginx/ssl/*.pem
+# Nginx SSL certificates (keep structure, ignore files)
+
+*.sqlite3
+*.db
+# Database
+
+Thumbs.db
+.DS_Store
+# OS
+
+.docker/
+# Docker
+
+.tox/
+htmlcov/
+.coverage
+.pytest_cache/
+# Testing
+
+logs/
+*.log
+# Logs
+
+.env.*.local
+.env.local
+.env
+# Environment variables
+
+*~
+*.swo
+*.swp
+.vscode/
+.idea/
+# IDE
+
+env/
+ENV/
+venv/
+.venv/
+# Virtual environments
+
+*.egg
+.installed.cfg
+*.egg-info/
+wheels/
+var/
+sdist/
+parts/
+lib64/
+lib/
+.eggs/
+eggs/
+downloads/
+dist/
+develop-eggs/
+build/
+.Python
+*.so
+*$py.class
+*.py[cod]
+__pycache__/
