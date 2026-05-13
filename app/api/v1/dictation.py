@@ -178,23 +178,26 @@ async def submit_answer(
     if not attempt:
         raise NotFoundError("Session not found")
 
-    # Get correct transcript segment
+    # Get correct transcript segment by position (resilient to index gaps)
     result = await db.execute(
-        select(Transcript).where(
-            Transcript.video_id == attempt.video_id,
-            Transcript.index == body.sentence_index,
-        )
+        select(Transcript)
+        .where(Transcript.video_id == attempt.video_id)
+        .order_by(Transcript.index)
+        .offset(body.sentence_index)
+        .limit(1)
     )
     transcript = result.scalar_one_or_none()
     if not transcript:
         raise NotFoundError("Transcript segment not found")
 
-    # Compute word diff
-    diffs, score = compute_word_diff(body.user_input, transcript.text)
-
-    # Apply hint penalty
-    hint_penalty = body.hints_used * 0.05
-    final_score = max(0, score - hint_penalty)
+    # Handle skipped sentences — no word diff, score = 0
+    if body.skipped:
+        diffs = []
+        final_score = 0.0
+    else:
+        diffs, score = compute_word_diff(body.user_input, transcript.text)
+        hint_penalty = body.hints_used * 0.05
+        final_score = max(0, score - hint_penalty)
 
     # Upsert sentence result (update if same sentence submitted again)
     existing_sentence = (await db.execute(
@@ -242,6 +245,21 @@ async def submit_answer(
         attempt.completed_at = datetime.now(timezone.utc)
 
     await db.commit()
+
+    if body.skipped:
+        return SentenceResultResponse(
+            sentence_index=body.sentence_index,
+            score=0.0,
+            word_diffs=[],
+            correct_count=0,
+            wrong_count=0,
+            missing_count=0,
+            is_skipped=True,
+            original_text=transcript.text,
+            video_id=attempt.video_id,
+            audio_start_time=transcript.start_time,
+            word_difficulty={},
+        )
 
     correct = sum(1 for d in diffs if d.status == "correct")
     wrong = sum(1 for d in diffs if d.status == "wrong")

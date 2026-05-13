@@ -6,6 +6,7 @@ class SubmitAnswerRequest(BaseModel):
     user_input: str
     hints_used: int = 0
     replay_count: int = 0
+    skipped: bool = False
 
 
 class WordDiffItem(BaseModel):
@@ -21,6 +22,7 @@ class SentenceResultResponse(BaseModel):
     correct_count: int
     wrong_count: int
     missing_count: int
+    is_skipped: bool = False
     # Vocabulary saving context
     original_text: str
     video_id: str
