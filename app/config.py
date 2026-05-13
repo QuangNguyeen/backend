@@ -33,6 +33,31 @@ class Settings(BaseSettings):
     # Google Cloud (Translation API)
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
 
+    # Google Cloud STT / GCS
+    GCP_PROJECT_ID: str = ""
+    GCS_BUCKET_NAME: str = ""
+
+    # Google OAuth
+    GOOGLE_CLIENT_ID: str = ""
+
+    # Celery / Redis
+    REDIS_URL: str = "redis://localhost:6379/0"
+    CELERY_BROKER_URL: str = ""
+    CELERY_RESULT_BACKEND: str = ""
+
+    @property
+    def celery_broker(self) -> str:
+        return self.CELERY_BROKER_URL or self.REDIS_URL
+
+    @property
+    def celery_backend(self) -> str:
+        return self.CELERY_RESULT_BACKEND or self.REDIS_URL
+
+    # Sync DB URL for Celery workers (replace asyncpg with psycopg2)
+    @property
+    def DATABASE_URL_SYNC(self) -> str:
+        return self.DATABASE_URL.replace("+asyncpg", "+psycopg2").replace("postgresql+psycopg2", "postgresql+psycopg2")
+
     model_config = {"env_file": str(_ENV_FILE), "extra": "ignore"}
 
 

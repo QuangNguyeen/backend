@@ -24,7 +24,7 @@ class SavedWord(Base):
     phonetic: Mapped[str | None] = mapped_column(String(100), nullable=True)
     audio_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     context_translation: Mapped[str | None] = mapped_column(Text, nullable=True)
-    part_of_speech: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    part_of_speech: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     # SM-2 SRS fields
     ease_factor: Mapped[float] = mapped_column(Float, default=2.5)

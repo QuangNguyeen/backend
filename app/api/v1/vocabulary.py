@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import io
 import logging
@@ -102,45 +103,58 @@ async def _enrich_and_persist(
     context_hash: str,
     overwrite_meaning: bool,
 ) -> None:
-    """Background task: Dictionary → Google Translate, update SavedWord + WordCache.
+    """Background task: fetch dictionary data, update SavedWord + WordCache.
 
-    Sequential pipeline (no LLM):
-    1. dictionaryapi.dev → audio URL, IPA, English definition
-    2. Google Translate → Vietnamese translation of English definition
-    3. Google Translate → Vietnamese translation of context sentence
+    Checks global WordCache first; on miss calls dictionaryapi.dev + Gemini.
+    Context sentence translation is always fetched via Google Translate.
     """
-    # Step 1: Dictionary API
+    # Check global cache first
+    phonetic: str | None = None
+    vietnamese_meaning: str | None = None
+    part_of_speech: str | None = None
+    audio_url: str | None = None
+
     try:
-        dict_data = await fetch_dictionary_data(word_text, translate_meaning=False)
-    except Exception as e:
-        logger.warning("Dictionary lookup crashed for word_id=%s: %s", saved_word_id, e)
-        dict_data = DictionaryResult()
+        async with async_session() as session:
+            result = await session.execute(
+                select(WordCache).where(
+                    WordCache.word == word_text,
+                    WordCache.vietnamese_meaning.isnot(None),
+                ).limit(1)
+            )
+            cached = result.scalar_one_or_none()
+            if cached:
+                phonetic = cached.phonetic
+                vietnamese_meaning = cached.vietnamese_meaning
+                part_of_speech = cached.part_of_speech
+                audio_url = cached.audio_url
+    except Exception:
+        pass
 
-    # Step 2: Translate English definition to Vietnamese
-    if dict_data.meaning_en:
-        translated = await google_translate(dict_data.meaning_en, target_language="vi")
-        if translated:
-            dict_data.meaning_vi = translated
+    if not vietnamese_meaning:
+        try:
+            dict_data = await fetch_dictionary_data(word_text, translate_meaning=True)
+        except Exception as e:
+            logger.warning("Dictionary lookup crashed for word_id=%s: %s", saved_word_id, e)
+            dict_data = DictionaryResult()
 
-    # Step 3: Translate context sentence to Vietnamese
-    context_translation: str | None = None
-    if context_sentence:
-        context_translation = await _translate_sentence(context_sentence)
+        phonetic = dict_data.phonetic
+        vietnamese_meaning = dict_data.meaning_vi or dict_data.meaning_en
+        part_of_speech = dict_data.part_of_speech
+        audio_url = dict_data.audio_url
 
-    phonetic = dict_data.phonetic
-    vietnamese_meaning = dict_data.meaning_vi or dict_data.meaning_en
-    part_of_speech = dict_data.part_of_speech
-    audio_url = dict_data.audio_url
     if not audio_url:
         from urllib.parse import quote
         audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(word_text)}"
 
+    context_translation: str | None = None
+    if context_sentence:
+        context_translation = await _translate_sentence(context_sentence)
+
     have_any = any(v is not None for v in (phonetic, audio_url, vietnamese_meaning, context_translation))
     if not have_any:
-        return  # truly nothing to persist — leave the row for a future retry flow
+        return
 
-    # Write SavedWord first, in its own transaction, so a WordCache conflict
-    # can never roll back the user-visible row.
     try:
         async with async_session() as session:
             result = await session.execute(
@@ -162,21 +176,17 @@ async def _enrich_and_persist(
     except Exception as e:
         logger.exception("SavedWord update failed for word_id=%s: %s", saved_word_id, e)
 
-    cache_values = dict(
-        word=word_text,
-        context_hash=context_hash,
-        phonetic=phonetic,
-        audio_url=audio_url,
-        vietnamese_meaning=vietnamese_meaning,
-        part_of_speech=part_of_speech,
-    )
-    if context_translation is not None:
-        cache_values["context_translation"] = context_translation
-
+    # Persist to global cache
     try:
         async with async_session() as session:
             stmt = pg_insert(WordCache).values(
-                **cache_values,
+                word=word_text,
+                context_hash="__global__",
+                phonetic=phonetic,
+                audio_url=audio_url,
+                vietnamese_meaning=vietnamese_meaning,
+                part_of_speech=part_of_speech,
+                context_translation=context_translation,
             ).on_conflict_do_nothing(
                 index_elements=["word", "context_hash"],
             )
@@ -206,17 +216,17 @@ async def save_word(
     lemma = _lemmatize(body.word, body.context_sentence).lower()
 
     context_hash: str | None = None
-    cached: WordCache | None = None
-
     if body.context_sentence:
         context_hash = _hash_context(body.context_sentence)
-        result = await db.execute(
-            select(WordCache).where(
-                WordCache.word == lemma,
-                WordCache.context_hash == context_hash,
-            )
-        )
-        cached = result.scalar_one_or_none()
+
+    # Global word-level cache lookup
+    cache_result = await db.execute(
+        select(WordCache).where(
+            WordCache.word == lemma,
+            WordCache.vietnamese_meaning.isnot(None),
+        ).limit(1)
+    )
+    cached = cache_result.scalar_one_or_none()
 
     meaning = body.meaning
     phonetic = body.phonetic
@@ -365,72 +375,62 @@ async def preview_word(
 ):
     """Return enrichment data for a word without saving it.
 
-    Checks WordCache first; on miss, calls dictionary API + Google Translate and caches.
+    Fast path: global WordCache lookup by word (ignores context_hash).
+    Slow path: parallel dictionaryapi.dev + Gemini, then cache result.
+    Context translation is always handled separately via Google Translate.
     """
     lemma = _lemmatize(word, context).lower()
 
-    # Check if user already saved this word
-    saved_result = await db.execute(
-        select(SavedWord.id).where(
-            SavedWord.user_id == current_user.id,
-            SavedWord.word == lemma,
-            SavedWord.deleted_at.is_(None),
-        ).limit(1)
-    )
-    is_saved = saved_result.scalar() is not None
-
-    context_hash: str | None = None
-    if context:
-        context_hash = _hash_context(context)
-        result = await db.execute(
+    # ── Parallel DB queries: is_saved + cache lookup ──
+    saved_result, cache_result = await asyncio.gather(
+        db.execute(
+            select(SavedWord.id).where(
+                SavedWord.user_id == current_user.id,
+                SavedWord.word == lemma,
+                SavedWord.deleted_at.is_(None),
+            ).limit(1)
+        ),
+        db.execute(
             select(WordCache).where(
                 WordCache.word == lemma,
-                WordCache.context_hash == context_hash,
-            )
+                WordCache.vietnamese_meaning.isnot(None),
+            ).limit(1)
+        ),
+    )
+    is_saved = saved_result.scalar() is not None
+    cached = cache_result.scalar_one_or_none()
+
+    # ── Fast path: cache hit → return immediately ──
+    if cached:
+        context_translation = cached.context_translation
+        if not context_translation and context:
+            context_translation = await _translate_sentence(context)
+        return WordPreviewResponse(
+            word=lemma,
+            phonetic=cached.phonetic,
+            meaning=cached.vietnamese_meaning,
+            audio_url=_resolve_audio_url(cached.audio_url, request),
+            context_translation=context_translation,
+            is_saved=is_saved,
+            part_of_speech=cached.part_of_speech,
         )
-        cached = result.scalar_one_or_none()
-        if cached:
-            ctx_trans = cached.context_translation
-            if not ctx_trans and context:
-                ctx_trans = await _translate_sentence(context)
-                if ctx_trans:
-                    try:
-                        cached.context_translation = ctx_trans
-                        await db.commit()
-                    except Exception:
-                        logger.warning("Cache heal failed for word=%r", lemma)
-            return WordPreviewResponse(
-                word=lemma,
-                phonetic=cached.phonetic,
-                meaning=cached.vietnamese_meaning,
-                audio_url=_resolve_audio_url(cached.audio_url, request),
-                context_translation=ctx_trans,
-                is_saved=is_saved,
-                part_of_speech=cached.part_of_speech,
-            )
 
-    # Sequential pipeline (no LLM):
-    # 1. Dictionary API → audio, IPA, English definition
-    # 2. Google Translate → Vietnamese meaning
-    # 3. Google Translate → Vietnamese context translation
+    # ── Slow path: parallel Gemini + dictionaryapi.dev + context translation ──
+    tasks: list[asyncio.Task] = []
+    tasks.append(asyncio.ensure_future(fetch_dictionary_data(lemma, translate_meaning=True)))
+    if context:
+        tasks.append(asyncio.ensure_future(_translate_sentence(context)))
 
-    # Step 1: Dictionary API
-    try:
-        dict_data = await fetch_dictionary_data(lemma, translate_meaning=False)
-    except Exception as e:
-        logger.warning("Dictionary lookup failed for word=%r: %s", word, e)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    dict_data = results[0] if not isinstance(results[0], Exception) else DictionaryResult()
+    if isinstance(dict_data, Exception):
+        logger.warning("Dictionary lookup failed for word=%r: %s", word, dict_data)
         dict_data = DictionaryResult()
 
-    # Step 2: Translate English definition to Vietnamese
-    if dict_data.meaning_en:
-        translated = await google_translate(dict_data.meaning_en, target_language="vi")
-        if translated:
-            dict_data.meaning_vi = translated
-
-    # Step 3: Translate context sentence to Vietnamese
     context_translation: str | None = None
-    if context:
-        context_translation = await _translate_sentence(context)
+    if context and len(results) > 1 and not isinstance(results[1], Exception):
+        context_translation = results[1]
 
     phonetic = dict_data.phonetic
     vietnamese_meaning = dict_data.meaning_vi or dict_data.meaning_en
@@ -440,10 +440,11 @@ async def preview_word(
         from urllib.parse import quote
         audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(lemma)}"
 
-    if context and context_hash:
+    # Persist to global cache (context_hash = "__global__" sentinel)
+    try:
         cache_values = dict(
             word=lemma,
-            context_hash=context_hash,
+            context_hash="__global__",
             phonetic=phonetic,
             audio_url=audio_url,
             vietnamese_meaning=vietnamese_meaning,
@@ -451,14 +452,13 @@ async def preview_word(
         )
         if context_translation is not None:
             cache_values["context_translation"] = context_translation
-        try:
-            stmt = pg_insert(WordCache).values(
-                **cache_values,
-            ).on_conflict_do_nothing(index_elements=["word", "context_hash"])
-            await db.execute(stmt)
-            await db.commit()
-        except Exception as e:
-            logger.warning("WordCache upsert failed in preview for word=%r: %s", lemma, e)
+        stmt = pg_insert(WordCache).values(
+            **cache_values,
+        ).on_conflict_do_nothing(index_elements=["word", "context_hash"])
+        await db.execute(stmt)
+        await db.commit()
+    except Exception as e:
+        logger.warning("WordCache upsert failed in preview for word=%r: %s", lemma, e)
 
     return WordPreviewResponse(
         word=lemma,

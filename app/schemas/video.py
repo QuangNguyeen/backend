@@ -19,6 +19,8 @@ class VideoResponse(BaseModel):
     is_curated: bool
     is_active: bool
     is_auto_generated: bool = False
+    transcription_status: str = "ready"
+    transcription_error: str | None = None
     thumbnail_url: str
     play_count: int = 0
     best_score: float | None = None

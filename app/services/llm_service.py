@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 
 import httpx
+import pydantic
 from google import genai
 
 from app.config import get_settings
@@ -230,19 +231,55 @@ class DictionaryResult:
     part_of_speech: str | None = None
 
 
-async def fetch_dictionary_data(word: str, translate_meaning: bool = True) -> DictionaryResult:
-    """Single call to dictionaryapi.dev — extracts audio, IPA, and English meaning.
+class DictionaryMeaning(pydantic.BaseModel):
+    part_of_speech: str
+    meaning_vi: str
+    meaning_en: str
 
-    When dictionaryapi.dev has no matching audio, the audio_url falls back to
-    an internal gTTS endpoint path (resolved to an absolute URL at response time).
 
-    Args:
-        word: The word to look up.
-        translate_meaning: When True (default), translate the English definition
-            to Vietnamese via Google Cloud Translation. Set to False when the
-            caller will handle translation separately.
-    """
+class GeminiDictionaryResponse(pydantic.BaseModel):
+    phonetic: str
+    meanings: list[DictionaryMeaning]
+
+
+async def _fetch_gemini_dictionary(word: str) -> GeminiDictionaryResponse | None:
+    """Use Gemini to get accurate IPA and English-Vietnamese dictionary definitions."""
+    client = _get_client()
+    if not client:
+        return None
+
+    prompt = (
+        f"You are a professional English-Vietnamese dictionary. "
+        f"Look up the English word '{word}'. "
+        f"For 'phonetic', provide the most common IPA pronunciation (e.g. /wɪnd/ for wind meaning breeze). "
+        f"For 'meaning_vi', provide concise, accurate Vietnamese dictionary equivalents (1-4 words max). "
+        f"For 'meaning_en', provide a short English definition (under 10 words). "
+        f"Do NOT provide long explanatory sentences. Return only the most common parts of speech (max 3)."
+    )
+
+    try:
+        response = await client.aio.models.generate_content(
+            model=_MODEL_NAME,
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=GeminiDictionaryResponse,
+                temperature=0.1,
+            ),
+        )
+        if response.text:
+            data = json.loads(response.text)
+            return GeminiDictionaryResponse(**data)
+    except Exception as e:
+        logger.warning("Gemini dictionary lookup failed for word=%r: %s", word, e)
+
+    return None
+
+
+async def _fetch_dictionary_audio_ipa(word: str) -> DictionaryResult:
+    """Fetch audio URL and IPA from dictionaryapi.dev (meanings are handled by Gemini)."""
     url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
+    result = DictionaryResult()
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(url)
@@ -251,22 +288,13 @@ async def fetch_dictionary_data(word: str, translate_meaning: bool = True) -> Di
     except Exception as e:
         logger.info("dictionaryapi.dev miss for word=%r: %s", word, e)
         from urllib.parse import quote
-        return DictionaryResult(audio_url=f"{_TTS_FALLBACK_PREFIX}{quote(word)}")
-
-    result = DictionaryResult()
-    w = word.lower()
+        result.audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(word)}"
+        return result
 
     for entry in entries or []:
         entry_word = (entry.get("word") or "").lower()
-        if entry_word and entry_word != w:
+        if entry_word and entry_word != word.lower():
             continue
-
-        if not result.audio_url:
-            for phon in entry.get("phonetics", []) or []:
-                audio = phon.get("audio")
-                if audio and _audio_url_matches_word(audio, word):
-                    result.audio_url = audio
-                    break
 
         if not result.phonetic:
             for phon in entry.get("phonetics", []) or []:
@@ -279,27 +307,55 @@ async def fetch_dictionary_data(word: str, translate_meaning: bool = True) -> Di
                 if top and top.strip():
                     result.phonetic = top.strip()
 
-        if not result.meaning_en:
-            for mg in entry.get("meanings", []) or []:
-                for defn in mg.get("definitions", []) or []:
-                    text = defn.get("definition")
-                    if text and text.strip():
-                        result.meaning_en = text.strip()
-                        pos = mg.get("partOfSpeech", "")
-                        if pos:
-                            result.part_of_speech = pos
-                        break
-                if result.meaning_en:
+        if not result.audio_url:
+            for phon in entry.get("phonetics", []) or []:
+                audio = phon.get("audio")
+                if audio and _audio_url_matches_word(audio, word):
+                    result.audio_url = audio
                     break
+
+        if result.phonetic and result.audio_url:
+            break
 
     if not result.audio_url:
         from urllib.parse import quote
         result.audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(word)}"
-        logger.info("Using internal TTS fallback for word=%r", word)
 
-    if translate_meaning and result.meaning_en:
-        translated = await google_translate(result.meaning_en, target_language="vi")
-        if translated:
-            result.meaning_vi = translated
+    return result
+
+
+async def fetch_dictionary_data(word: str, translate_meaning: bool = True) -> DictionaryResult:
+    """Fetch audio/IPA from dictionaryapi.dev and meanings from Gemini.
+
+    Args:
+        word: The word to look up.
+        translate_meaning: When True (default), use Gemini for Vietnamese meanings.
+    """
+    dict_task = _fetch_dictionary_audio_ipa(word)
+
+    if translate_meaning:
+        dict_result, gemini_result = await asyncio.gather(
+            dict_task,
+            _fetch_gemini_dictionary(word),
+        )
+    else:
+        dict_result = await dict_task
+        gemini_result = None
+
+    result = dict_result
+
+    if gemini_result:
+        if gemini_result.phonetic:
+            result.phonetic = gemini_result.phonetic
+
+        parts: list[str] = []
+        for m in gemini_result.meanings:
+            pos = m.part_of_speech.lower()
+            parts.append(f"{pos}: {m.meaning_vi}")
+            if not result.meaning_en:
+                result.meaning_en = m.meaning_en
+            if not result.meaning_vi:
+                result.meaning_vi = m.meaning_vi
+        result.part_of_speech = "; ".join(parts)
 
     return result

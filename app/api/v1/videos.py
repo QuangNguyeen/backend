@@ -26,7 +26,7 @@ from youtube_transcript_api._errors import TranscriptsDisabled, VideoUnavailable
 
 from app.services import youtube_service
 from app.services.level_service import analyze_level, estimate_cefr_with_speech_rate
-from app.services.llm_service import punctuate_transcript
+from app.tasks.transcription import run_stt_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +217,22 @@ async def import_video(
             logger.error("Layer 2 failed — yt-dlp subtitle fallback for %s: %s", video_id, e, exc_info=True)
             transcript_error = transcript_error or e
 
-    # 2c. All transcript layers failed → return partial response (no DB rollback)
+    # 2c. Transcript — Layer 3: If no subs found at all, dispatch STT via Celery
+    dispatch_stt_layer3 = False
+    if segments is None:
+        video_duration_for_stt = metadata.get("duration", 0)
+        if video_duration_for_stt <= 300:
+            dispatch_stt_layer3 = True
+            logger.info(
+                "No subtitles found for %s — will dispatch Celery STT task (duration=%ds)",
+                video_id, video_duration_for_stt,
+            )
+            segments = []
+            transcript_error = None
+        else:
+            transcript_error = transcript_error or Exception("No subtitles available and video too long for STT")
+
+    # 2d. All transcript layers failed → return partial response (no DB rollback)
     if segments is None:
         return JSONResponse(
             status_code=206,
@@ -238,12 +253,12 @@ async def import_video(
     # 3. Merge & analyze (pure computation, no network)
     merged_segments = youtube_service.merge_segments_smart(
         segments, max_duration=body.max_segment_duration
-    )
+    ) if segments else []
 
     video_duration = metadata.get("duration") or (int(merged_segments[-1].end) if merged_segments else 0)
     if body.level:
         detected_level = body.level
-    else:
+    elif merged_segments:
         full_text = youtube_service.get_full_text(segments)
         if body.language == "en" and video_duration > 0:
             detected_level = estimate_cefr_with_speech_rate(
@@ -252,21 +267,24 @@ async def import_video(
         else:
             detected_level = analyze_level(full_text, language=body.language)
         logger.info("Auto-detected level for video %s: %s", video_id, detected_level)
+    else:
+        detected_level = None
 
     # ── Phase 2: Database writes (all external data ready) ────────────────
 
-    # Detect auto-generated subs by punctuation density.
-    # Auto-gen YouTube subs almost never include sentence punctuation; manually-uploaded subs do.
-    sentence_punct = (".", "?", "!")
-    if merged_segments:
-        with_punct = sum(
-            1 for seg in merged_segments
-            if any(c in seg.text for c in sentence_punct)
+    # Detect auto-generated subs on RAW segments (before merge).
+    # Auto-gen subs chop mid-sentence — raw segments rarely end with .?!
+    # Manually-uploaded subs have proper sentence boundaries.
+    if segments:
+        ends_with_punct = sum(
+            1 for seg in segments
+            if seg.text.rstrip().endswith((".", "?", "!"))
         )
-        is_auto_generated = (with_punct / len(merged_segments)) < 0.30
+        ratio = ends_with_punct / len(segments)
+        is_auto_generated = ratio < 0.50
         logger.warning(
-            "Import auto-gen detection for %s: %d/%d segments with punct → is_auto=%s",
-            video_id, with_punct, len(merged_segments), is_auto_generated,
+            "Import auto-gen detection for %s: %d/%d raw segments end with punct (%.0f%%) → is_auto=%s",
+            video_id, ends_with_punct, len(segments), ratio * 100, is_auto_generated,
         )
     else:
         is_auto_generated = False
@@ -280,49 +298,8 @@ async def import_video(
             f"Please choose a shorter video or one with manually uploaded subtitles."
         )
 
-    # Punctuate auto-generated subs via Gemini (best-effort).
-    # Uses original un-merged segments for finest-grained timestamp alignment.
-    if is_auto_generated and segments:
-        try:
-            full_raw_text = " ".join(seg.text for seg in segments)
-            logger.warning(
-                "Auto-generated subs detected for %s, calling Gemini punctuation (%d words)…",
-                video_id, len(full_raw_text.split()),
-            )
-            punctuated_text = await punctuate_transcript(
-                full_raw_text, language=body.language
-            )
-            if punctuated_text:
-                punctuated_segments = _redistribute_punctuated_text(
-                    punctuated_text, segments
-                )
-                merged_segments = youtube_service.merge_segments_smart(
-                    punctuated_segments, max_duration=body.max_segment_duration
-                )
-                logger.warning(
-                    "Punctuated auto-generated subs for %s via Gemini "
-                    "(%d raw segments → %d punctuated sentences → %d merged chunks)",
-                    video_id,
-                    len(segments),
-                    len(punctuated_segments),
-                    len(merged_segments),
-                )
-                for i, seg in enumerate(merged_segments[:3]):
-                    logger.warning(
-                        "  Chunk %d: [%.1f–%.1f] %s",
-                        i, seg.start, seg.end,
-                        seg.text[:80] + ("…" if len(seg.text) > 80 else ""),
-                    )
-            else:
-                logger.warning(
-                    "Gemini punctuation returned None for %s, using raw text",
-                    video_id,
-                )
-        except Exception as e:
-            logger.warning(
-                "Punctuation enrichment failed for %s, using raw text: %s",
-                video_id, e,
-            )
+    # Determine whether to dispatch async STT upgrade via Celery
+    dispatch_stt = dispatch_stt_layer3 or (is_auto_generated and video_duration <= MAX_AUTO_GEN_DURATION)
 
     video = Video(
         youtube_id=video_id,
@@ -334,6 +311,7 @@ async def import_video(
         is_curated=False,
         is_active=True,
         is_auto_generated=is_auto_generated,
+        transcription_status="pending" if dispatch_stt else "ready",
         thumbnail_url=resolved_thumbnail,
         created_by=current_user.id,
     )
@@ -358,6 +336,19 @@ async def import_video(
     await db.commit()
     await db.refresh(video)
 
+    if dispatch_stt:
+        task = run_stt_pipeline.delay(
+            video_db_id=video.id,
+            youtube_id=video_id,
+            language=body.language,
+            video_duration=video_duration,
+            max_segment_duration=body.max_segment_duration,
+        )
+        logger.info(
+            "Dispatched STT Celery task %s for video %s (%s)",
+            task.id, video.id, video_id,
+        )
+
     return video
 
 
@@ -366,6 +357,19 @@ async def import_video(
 async def get_transcript_languages(video_id: str):
     """List available transcript languages for a YouTube video."""
     return youtube_service.list_available_transcripts(video_id)
+
+
+@router.get("/{video_id}/transcription-status")
+async def get_transcription_status(video_id: str, db: AsyncSession = Depends(get_db)):
+    """Poll transcription status for a video being processed by Celery."""
+    result = await db.execute(
+        select(Video.transcription_status, Video.transcription_error)
+        .where(Video.id == video_id)
+    )
+    row = result.one_or_none()
+    if not row:
+        raise NotFoundError("Video not found")
+    return {"status": row[0], "error": row[1]}
 
 
 @router.get("/{video_id}", response_model=VideoResponse)
@@ -400,7 +404,7 @@ async def bulk_update_transcripts(
     video = (await db.execute(select(Video).where(Video.id == video_id))).scalar_one_or_none()
     if not video:
         raise NotFoundError("Video not found")
-    if video.created_by != current_user.id:
+    if video.created_by != current_user.id and not current_user.is_admin:
         raise ForbiddenError("You can only edit subtitles of videos you created")
 
     ids = [item.transcript_id for item in body.items]
@@ -422,6 +426,15 @@ async def bulk_update_transcripts(
             if item.text:
                 row.text = item.text
                 updated += 1
+
+    if deleted > 0:
+        remaining = (await db.execute(
+            select(Transcript)
+            .where(Transcript.video_id == video_id)
+            .order_by(Transcript.index)
+        )).scalars().all()
+        for idx, t in enumerate(remaining):
+            t.index = idx
 
     await db.commit()
     return TranscriptBulkUpdateResponse(updated=updated + deleted)
@@ -498,7 +511,7 @@ async def delete_video(
     if not video:
         raise NotFoundError("Video not found")
 
-    if video.created_by != current_user.id:
+    if video.created_by != current_user.id and not current_user.is_admin:
         raise ForbiddenError("You can only delete videos you created")
 
     # Delete related dictation attempts and their sentences
@@ -536,7 +549,7 @@ async def refresh_transcript(
     if not video:
         raise NotFoundError("Video not found")
 
-    if video.created_by != current_user.id:
+    if video.created_by != current_user.id and not current_user.is_admin:
         raise ForbiddenError("You can only refresh videos you created")
 
     # Re-fetch metadata (never raises)
@@ -568,17 +581,17 @@ async def refresh_transcript(
         segments, max_duration=max_segment_duration
     )
 
-    # Detect auto-generated subs and punctuate if needed
-    sentence_punct = (".", "?", "!")
-    if merged_segments:
-        with_punct = sum(
-            1 for seg in merged_segments
-            if any(c in seg.text for c in sentence_punct)
+    # Detect auto-generated subs on RAW segments (before merge).
+    if segments:
+        ends_with_punct = sum(
+            1 for seg in segments
+            if seg.text.rstrip().endswith((".", "?", "!"))
         )
-        refresh_is_auto = (with_punct / len(merged_segments)) < 0.30
+        ratio = ends_with_punct / len(segments)
+        refresh_is_auto = ratio < 0.50
         logger.warning(
-            "Refresh auto-gen detection for %s: %d/%d segments with punct → is_auto=%s",
-            video_id, with_punct, len(merged_segments), refresh_is_auto,
+            "Refresh auto-gen detection for %s: %d/%d raw segments end with punct (%.0f%%) → is_auto=%s",
+            video_id, ends_with_punct, len(segments), ratio * 100, refresh_is_auto,
         )
     else:
         refresh_is_auto = False
@@ -593,38 +606,14 @@ async def refresh_transcript(
             f"Please choose a shorter video or one with manually uploaded subtitles."
         )
 
-    if refresh_is_auto and segments:
-        try:
-            full_raw_text = " ".join(seg.text for seg in segments)
-            logger.warning(
-                "Auto-generated subs detected on refresh for %s, calling Gemini punctuation…",
-                video_id,
-            )
-            punctuated_text = await punctuate_transcript(
-                full_raw_text, language=video.language
-            )
-            if punctuated_text:
-                punctuated_segments = _redistribute_punctuated_text(
-                    punctuated_text, segments
-                )
-                merged_segments = youtube_service.merge_segments_smart(
-                    punctuated_segments, max_duration=max_segment_duration
-                )
-                logger.warning(
-                    "Punctuated refreshed subs for %s via Gemini (%d segments)",
-                    video.id, len(merged_segments),
-                )
-            else:
-                logger.warning(
-                    "Gemini punctuation returned None on refresh for %s, using raw text",
-                    video_id,
-                )
-        except Exception as e:
-            logger.warning(
-                "Punctuation enrichment failed on refresh for %s: %s", video_id, e,
-            )
+    dispatch_stt_refresh = refresh_is_auto and video.duration and video.duration <= MAX_AUTO_GEN_DURATION
 
-    # Create new transcript records
+    if dispatch_stt_refresh:
+        video.transcription_status = "pending"
+    else:
+        video.transcription_status = "ready"
+
+    # Create new transcript records (auto-gen subs as placeholder until STT completes)
     for idx, segment in enumerate(merged_segments):
         transcript = Transcript(
             video_id=video.id,
@@ -640,8 +629,8 @@ async def refresh_transcript(
     if merged_segments and not video.duration:
         video.duration = int(merged_segments[-1].end)
 
-    # Re-analyze CEFR level
-    if merged_segments:
+    # Re-analyze CEFR level (only if not dispatching STT — it will recalculate)
+    if merged_segments and not dispatch_stt_refresh:
         full_text = youtube_service.get_full_text(segments)
         if video.language == "en" and video.duration > 0:
             video.level = estimate_cefr_with_speech_rate(
@@ -653,5 +642,15 @@ async def refresh_transcript(
 
     await db.commit()
     await db.refresh(video)
+
+    if dispatch_stt_refresh:
+        task = run_stt_pipeline.delay(
+            video_db_id=video.id,
+            youtube_id=video.youtube_id,
+            language=video.language,
+            video_duration=video.duration,
+            max_segment_duration=max_segment_duration,
+        )
+        logger.info("Dispatched STT Celery task %s on refresh for %s", task.id, video_id)
 
     return video

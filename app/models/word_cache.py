@@ -20,5 +20,5 @@ class WordCache(Base):
     audio_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     vietnamese_meaning: Mapped[str | None] = mapped_column(Text, nullable=True)
     context_translation: Mapped[str | None] = mapped_column(Text, nullable=True)
-    part_of_speech: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    part_of_speech: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
