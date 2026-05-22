@@ -42,48 +42,34 @@ MAX_STT_DURATION = 300  # 5 minutes
 
 _GEMINI_MODEL = "gemini-2.5-flash"
 
-_SENTENCE_SPLIT_PROMPT = """You are an expert English language teacher specialized in transcript analysis and grammar correction.
+_SENTENCE_SPLIT_PROMPT = """You are an expert English language teacher specialized in transcript analysis and sentence segmentation for language learners.
 
-Your task: Given a raw transcript (no punctuation), add PROPER PUNCTUATION and split it
-into GRAMMATICALLY CORRECT, NATURAL-SOUNDING sentences.
+Your task: Given a raw transcript (no punctuation), add PROPER PUNCTUATION and split it into GRAMMATICALLY CORRECT, NATURAL-SOUNDING sentences suitable for dictation practice.
 
-CRITICAL RULES - DO NOT VIOLATE:
+The text may contain "|" markers indicating speaker pauses/phrase boundaries from the audio timing. These are strong hints that a sentence boundary exists nearby.
 
-1. **PRESERVE ALL WORDS**:
-   - Keep every single word exactly as spoken
-   - Only add punctuation marks
-   - Never change, remove, or add words
+CRITICAL RULES:
 
-2. **SENTENCE BOUNDARIES** - When to split:
-   - Period (.) = Statement ends -> new sentence
-   - Question mark (?) = Question ends -> new sentence
-   - Exclamation mark (!) = Emphasis -> new sentence
-   - "And" connecting TWO INDEPENDENT CLAUSES -> consider splitting
-   - "But" = contrast -> usually new sentence
-   - "Because", "since" = reason -> keep in SAME sentence with comma
-   - "Although", "though" = concession -> keep in SAME sentence with comma
+1. **PRESERVE ALL WORDS EXACTLY** - only add punctuation, never change/remove/add words.
 
-3. **REPETITION HANDLING**:
-   - If same word/phrase repeats = DEFINITE sentence boundary
-   - First occurrence = intro/topic, second = explanation/detail
+2. **SENTENCE BOUNDARIES** - Split at:
+   - Statement endings (.)
+   - Questions (?)
+   - Exclamations (!)
+   - Subject changes
+   - "|" markers often indicate a sentence boundary - respect them unless combining would create a more natural sentence
+   - "And"/"But" connecting independent clauses → split into separate sentences
+   - Prefer SHORTER sentences (6-15 words) for dictation clarity
 
-4. **TIME & PLACE ADVERBIALS** signal new focus:
-   "Each week", "Every day", "When I" -> often new sentence
+3. **SPECIAL CASES**:
+   - Repeated words/phrases = DEFINITE boundary (e.g. "the future ... the future" = two sentences)
+   - Time/place adverbials ("Each week", "In the past") often start new sentences
+   - Non-speech labels like "foreign" or "music" → keep as their own short segment
 
-5. **CLAUSE STRUCTURE**:
-   - Independent + dependent clause -> SAME sentence with comma
-   - Two independent clauses -> DIFFERENT sentences
-   - Subject change -> NEW sentence
-
-6. **QUALITY CHECKS** - Each sentence must:
-   - Have a clear subject and verb
-   - Express one complete idea
-   - No fragments, no run-on sentences
-
-7. **OUTPUT FORMAT**:
-   - Return ONLY valid JSON array of strings
+4. **OUTPUT FORMAT**:
+   - Return ONLY a valid JSON array of strings
    - Each string = one complete sentence with proper punctuation
-   - No markdown code blocks, no explanations
+   - No markdown, no explanations
 
 Raw transcript:
 "{raw_text}"
@@ -100,6 +86,8 @@ def _extract_audio(video_id: str, out_dir: Path) -> tuple[Path, int]:
         "--quiet", "--no-warnings",
         "-x",
         "--audio-format", "wav",
+
+
         "--postprocessor-args", "ffmpeg:-ac 1 -ar 16000",
         "-o", str(wav_path),
         url,
@@ -222,7 +210,7 @@ def _get_words_from_stt(gcs_uri: str, language: str) -> tuple[list[dict], str]:
 
 # ── Step 2: Gemini → sentence splitting ──────────────────────────────────
 
-def _split_sentences_with_gemini(raw_text: str) -> list[str]:
+def split_sentences_with_gemini(raw_text: str) -> list[str]:
     """Use Gemini to split raw transcript into punctuated sentences."""
     from google import genai
 
@@ -238,9 +226,14 @@ def _split_sentences_with_gemini(raw_text: str) -> list[str]:
     t0 = time.time()
 
     try:
+        from google.genai import types
         response = client.models.generate_content(
             model=_GEMINI_MODEL,
             contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                temperature=0.1,
+            ),
         )
     except Exception as e:
         logger.warning("[STT] Gemini API error, falling back to STT punctuation: %s", e)
@@ -292,6 +285,7 @@ def _map_sentences_to_words(
         start_idx = word_idx
         matched = 0
         saved_idx = word_idx
+        last_matched_idx = word_idx
         max_scan = len(sentence_words) * 3
 
         while word_idx < len(words) and matched < len(sentence_words) and (word_idx - start_idx) < max_scan:
@@ -299,6 +293,7 @@ def _map_sentences_to_words(
             sent_norm = sentence_words[matched]
             if stt_norm == sent_norm or stt_norm.startswith(sent_norm) or sent_norm.startswith(stt_norm):
                 matched += 1
+                last_matched_idx = word_idx
             word_idx += 1
 
         if matched < len(sentence_words) * 0.5:
@@ -312,9 +307,17 @@ def _map_sentences_to_words(
                 sent_num + 1, matched, len(sentence_words), sentence[:60],
             )
 
-        end_idx = word_idx - 1
+        end_idx = last_matched_idx
+        word_idx = last_matched_idx + 1
         start = words[start_idx]["start"]
         end = words[end_idx]["end"]
+
+        # Only cap if the last word's end actually overlaps the next word's start
+        if end_idx + 1 < len(words):
+            next_word_start = words[end_idx + 1]["start"]
+            if end > next_word_start:
+                end = next_word_start - 0.05
+                end = max(end, start + 0.1)
 
         segments.append(TranscriptSegment(
             text=sentence,
@@ -359,6 +362,7 @@ def _split_by_stt_punctuation(
 
         start_idx = word_idx
         matched = 0
+        last_matched_idx = word_idx
         max_scan = len(sent_words) * 3
 
         while word_idx < len(words) and matched < len(sent_words) and (word_idx - start_idx) < max_scan:
@@ -366,15 +370,24 @@ def _split_by_stt_punctuation(
             target = sent_words[matched]
             if stt_norm == target or stt_norm.startswith(target) or target.startswith(stt_norm):
                 matched += 1
+                last_matched_idx = word_idx
             word_idx += 1
 
         if matched == 0:
             word_idx = start_idx + 1
             continue
 
-        end_idx = word_idx - 1
+        end_idx = last_matched_idx
+        word_idx = last_matched_idx + 1
         start = words[start_idx]["start"]
         end = words[end_idx]["end"]
+
+        # Only cap if the last word's end actually overlaps the next word's start
+        if end_idx + 1 < len(words):
+            next_word_start = words[end_idx + 1]["start"]
+            if end > next_word_start:
+                end = next_word_start - 0.05
+                end = max(end, start + 0.1)
 
         segments.append(TranscriptSegment(
             text=sentence,
@@ -422,10 +435,11 @@ def _merge_short_segments(segments: list[TranscriptSegment]) -> list[TranscriptS
             # Short segment: try merging with the next one
             if cur_words < MIN_WORDS and i + 1 < len(result):
                 nxt = result[i + 1]
+                silence_gap = nxt.start - (cur.start + cur.duration)
                 combined_end = nxt.start + nxt.duration
                 combined_dur = combined_end - cur.start
 
-                if combined_dur <= MAX_MERGED_DURATION:
+                if silence_gap <= 1.0 and combined_dur <= MAX_MERGED_DURATION:
                     cur_text = cur.text.rstrip(" .,?!") + " " + nxt.text
                     merged.append(TranscriptSegment(
                         text=cur_text,
@@ -443,9 +457,10 @@ def _merge_short_segments(segments: list[TranscriptSegment]) -> list[TranscriptS
         if len(merged) >= 2 and len(merged[-1].text.split()) < MIN_WORDS:
             last = merged.pop()
             prev = merged[-1]
+            silence_gap = last.start - (prev.start + prev.duration)
             combined_end = last.start + last.duration
             combined_dur = combined_end - prev.start
-            if combined_dur <= MAX_MERGED_DURATION:
+            if silence_gap <= 1.0 and combined_dur <= MAX_MERGED_DURATION:
                 merged[-1] = TranscriptSegment(
                     text=prev.text.rstrip(" .,?!") + " " + last.text,
                     start=prev.start,
@@ -470,7 +485,215 @@ def _merge_short_segments(segments: list[TranscriptSegment]) -> list[TranscriptS
     return result
 
 
-# ── Public API ───────────────────────────────────────────────────────────
+# ── Post-processing: enforce non-overlapping segments ───────────────────
+
+def _enforce_non_overlapping(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    """Clamp each segment's end so it doesn't exceed the next segment's start.
+
+    This is a safety net applied after all other processing to guarantee
+    no audio overlap between consecutive segments.
+    """
+    if len(segments) <= 1:
+        return segments
+
+    EPSILON = 0.05
+    result = list(segments)
+    clamped = 0
+
+    for i in range(len(result) - 1):
+        cur = result[i]
+        nxt = result[i + 1]
+        if cur.end > nxt.start:
+            clamped_end = max(nxt.start - EPSILON, cur.start + 0.5)
+            result[i] = TranscriptSegment(
+                text=cur.text,
+                start=cur.start,
+                duration=clamped_end - cur.start,
+            )
+            clamped += 1
+
+    if clamped:
+        logger.info("[STT] Clamped %d overlapping segment boundaries", clamped)
+
+    return result
+
+
+# ── Gemini STT: single-call audio transcription with timestamps ─────────
+
+_GEMINI_STT_PROMPT = """Listen to this audio and transcribe every spoken word with its precise timestamp.
+
+Language: {language}
+
+Return a JSON object with two fields:
+
+1. "words" — an array of every spoken word with timing:
+   [{{"word": "Hello", "start": 0.5, "end": 0.9}}, ...]
+
+2. "sentences" — the same words grouped into grammatically complete, punctuated sentences:
+   ["Hello, how are you?", "I am fine."]
+
+Rules for words:
+- Include EVERY spoken word, in order
+- Timestamps (seconds) must be precise and monotonically increasing
+- Skip non-speech audio (music, silence, sound effects)
+
+Rules for sentences:
+- Each sentence = one complete thought with proper punctuation
+- Prefer 5-12 words per sentence
+- Never merge two independent clauses into one sentence
+- If a passage repeats (e.g. dictation exercise), include both occurrences"""
+
+
+def _parse_gemini_words_and_sentences(response_text: str) -> tuple[list[dict], list[str]]:
+    """Parse Gemini response containing word timestamps and sentences."""
+    if response_text.startswith("```"):
+        response_text = response_text.split("\n", 1)[1]
+        response_text = response_text.rsplit("```", 1)[0].strip()
+
+    try:
+        data = json.loads(response_text)
+    except json.JSONDecodeError as e:
+        logger.error("[Gemini-STT] Invalid JSON: %s | %s", e, response_text[:300])
+        return [], []
+
+    if not isinstance(data, dict):
+        logger.error("[Gemini-STT] Expected JSON object, got %s", type(data).__name__)
+        return [], []
+
+    words = []
+    for w in data.get("words", []):
+        word_text = str(w.get("word", "")).strip()
+        start = float(w.get("start", 0))
+        end = float(w.get("end", 0))
+        if word_text and end >= start:
+            words.append({"word": word_text, "start": start, "end": end})
+
+    sentences = [s.strip() for s in data.get("sentences", []) if isinstance(s, str) and s.strip()]
+
+    logger.info("[Gemini-STT] Parsed %d words and %d sentences", len(words), len(sentences))
+    return words, sentences
+
+
+def transcribe_with_gemini(
+    video_id: str,
+    language: str = "en",
+    video_duration: int = 0,
+) -> list[TranscriptSegment]:
+    """Transcribe YouTube audio using Gemini's native audio understanding.
+
+    Pipeline: extract audio → Gemini File API → word timestamps + sentences
+    → map sentences onto word timestamps for precise boundaries.
+    """
+    from app.core.exceptions import BadRequestError
+    from google import genai
+    from google.genai import types
+
+    settings = get_settings()
+    if not settings.GEMINI_API_KEY:
+        raise BadRequestError("GEMINI_API_KEY not configured for transcription.")
+
+    if video_duration > MAX_STT_DURATION:
+        raise BadRequestError(
+            f"AI transcription is limited to {MAX_STT_DURATION // 60} minutes. "
+            f"This video is {video_duration // 60}m {video_duration % 60}s. "
+            f"Please choose a shorter video or one with manual subtitles."
+        )
+
+    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    pipeline_t0 = time.time()
+    logger.info("[Gemini-STT] === Starting pipeline for %s (duration=%ds) ===", video_id, video_duration)
+
+    # Step 1: Extract audio
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        wav_path, actual_duration = _extract_audio(video_id, tmp_path)
+
+        if actual_duration > MAX_STT_DURATION:
+            raise BadRequestError(
+                f"AI transcription is limited to {MAX_STT_DURATION // 60} minutes. "
+                f"Detected audio is {actual_duration // 60}m {actual_duration % 60}s. "
+                f"Please choose a shorter video or one with manual subtitles."
+            )
+
+        # Step 2: Upload to Gemini File API
+        logger.info("[Gemini-STT] Uploading audio to Gemini File API...")
+        t0 = time.time()
+        audio_file = client.files.upload(file=str(wav_path))
+        logger.info("[Gemini-STT] Upload completed in %.1fs", time.time() - t0)
+
+    while audio_file.state.name == "PROCESSING":
+        time.sleep(2)
+        audio_file = client.files.get(name=audio_file.name)
+
+    if audio_file.state.name != "ACTIVE":
+        raise RuntimeError(f"Gemini file upload failed with state: {audio_file.state.name}")
+
+    # Step 3: Get word-level timestamps + sentences in one call
+    prompt = _GEMINI_STT_PROMPT.format(language=language)
+    logger.info("[Gemini-STT] Requesting word timestamps + sentences from %s...", _GEMINI_MODEL)
+    t0 = time.time()
+
+    try:
+        response = client.models.generate_content(
+            model=_GEMINI_MODEL,
+            contents=[audio_file, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1,
+                thinking_config=types.ThinkingConfig(thinking_budget=0)
+            ),
+        )
+    finally:
+        try:
+            client.files.delete(name=audio_file.name)
+        except Exception:
+            pass
+
+    elapsed = time.time() - t0
+    logger.info("[Gemini-STT] Gemini responded in %.1fs", elapsed)
+
+    response_text = (response.text or "").strip()
+    if not response_text:
+        logger.error("[Gemini-STT] Empty response from Gemini")
+        return []
+
+    # Step 4: Parse words and sentences
+    words, sentences = _parse_gemini_words_and_sentences(response_text)
+
+    if not words:
+        logger.warning("[Gemini-STT] No words parsed from response")
+        return []
+
+    if not sentences:
+        raw_text = " ".join(w["word"] for w in words)
+        logger.info("[Gemini-STT] No sentences in response, using Gemini text splitter")
+        sentences = split_sentences_with_gemini(raw_text)
+
+    if not sentences:
+        logger.warning("[Gemini-STT] No sentences available, cannot build segments")
+        return []
+
+    # Step 5: Map sentences onto word timestamps (precise boundaries)
+    segments = _map_sentences_to_words(sentences, words)
+
+    if not segments:
+        logger.warning("[Gemini-STT] Sentence-to-word mapping produced no segments")
+        return []
+
+    # Step 6: Merge short fragments
+    segments = _merge_short_segments(segments)
+
+    # Step 7: Guarantee no overlapping audio ranges
+    segments = _enforce_non_overlapping(segments)
+
+    logger.info(
+        "[Gemini-STT] === Pipeline complete for %s: %d segments in %.1fs ===",
+        video_id, len(segments), time.time() - pipeline_t0,
+    )
+    return segments
+
+
+# ── Legacy: Google Cloud STT pipeline (kept as fallback) ────────────────
 
 def transcribe_youtube_video(
     video_id: str,
@@ -527,7 +750,7 @@ def transcribe_youtube_video(
 
     # Step 2: Try Gemini for best sentence splitting
     raw_text = " ".join(w["word"] for w in words)
-    sentences = _split_sentences_with_gemini(raw_text)
+    sentences = split_sentences_with_gemini(raw_text)
 
     # Step 3: Map sentences to word timestamps
     if sentences:
@@ -539,6 +762,9 @@ def transcribe_youtube_video(
 
     # Step 4: Merge short fragments ("Easy." + "Learning English." → one segment)
     segments = _merge_short_segments(segments)
+
+    # Step 5: Guarantee no overlapping audio ranges
+    segments = _enforce_non_overlapping(segments)
 
     logger.info(
         "[STT] === Pipeline complete for %s: %d segments in %.1fs (audio at %s) ===",

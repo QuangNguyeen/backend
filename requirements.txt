@@ -44,6 +44,9 @@ google-cloud-storage>=3.10.0
 # LLM
 google-genai>=1.0.0
 
+# AssemblyAI
+assemblyai>=0.37.0
+
 # Task queue
 celery[redis]>=5.4.0
 redis>=5.0.0

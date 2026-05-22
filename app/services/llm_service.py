@@ -324,13 +324,130 @@ async def _fetch_dictionary_audio_ipa(word: str) -> DictionaryResult:
     return result
 
 
-async def fetch_dictionary_data(word: str, translate_meaning: bool = True) -> DictionaryResult:
-    """Fetch audio/IPA from dictionaryapi.dev and meanings from Gemini.
+_dict_cache: dict[str, tuple[float, DictionaryResult]] = {}
+_DICT_CACHE_TTL = 1800  # 30 min
+_DICT_CACHE_MAX = 3000
 
-    Args:
-        word: The word to look up.
-        translate_meaning: When True (default), use Gemini for Vietnamese meanings.
+
+async def fetch_dictionary_data(word: str, translate_meaning: bool = True) -> DictionaryResult:
+    """Fetch dictionary data for a word.
+
+    Primary: Cambridge Dictionary (en + en-vi in parallel) for IPA, audio, and translations.
+    Fallback: dictionaryapi.dev + Gemini if Cambridge fails.
     """
+    import time as _time
+    cache_key = f"{word}:{translate_meaning}"
+    cached = _dict_cache.get(cache_key)
+    if cached and (_time.monotonic() - cached[0]) < _DICT_CACHE_TTL:
+        return cached[1]
+
+    from app.services.cambridge_dictionary import lookup as cambridge_lookup
+
+    result = DictionaryResult()
+
+    # Primary path: Cambridge Dictionary (parallel en + en-vi)
+    try:
+        if translate_meaning:
+            en_entry, vi_entry = await asyncio.gather(
+                cambridge_lookup(word, dictionary="en"),
+                cambridge_lookup(word, dictionary="en-vi"),
+            )
+        else:
+            en_entry = await cambridge_lookup(word, dictionary="en")
+            vi_entry = None
+
+        entry = en_entry or vi_entry
+        if entry:
+            # IPA & audio - prefer UK pronunciation
+            for pron in entry.pronunciations:
+                if not result.phonetic and pron.ipa:
+                    result.phonetic = pron.ipa
+                if not result.audio_url and pron.audio_url:
+                    result.audio_url = pron.audio_url
+
+            # Detect inflected forms ("past simple of swim", "plural of house")
+            is_word_form = False
+            if en_entry and en_entry.definitions:
+                first_def = en_entry.definitions[0].definition.lower()
+                if any(marker in first_def for marker in (
+                    "past simple of", "past participle of", "present participle of",
+                    "plural of", "comparative of", "superlative of",
+                    "third person singular of", "short form of",
+                )):
+                    is_word_form = True
+                    result.meaning_en = en_entry.definitions[0].definition
+
+            # Part of speech with Vietnamese meanings
+            if vi_entry and vi_entry.definitions:
+                if is_word_form:
+                    # Inflected form: only take the first translation
+                    d = vi_entry.definitions[0]
+                    result.meaning_vi = d.translation
+                    result.part_of_speech = d.pos or ""
+                else:
+                    # Base form: collect unique POS+translation pairs (max 3)
+                    parts: list[str] = []
+                    seen_trans: set[str] = set()
+                    for d in vi_entry.definitions:
+                        if d.translation and d.translation not in seen_trans:
+                            seen_trans.add(d.translation)
+                            pos = d.pos or ""
+                            parts.append(f"{pos}: {d.translation}" if pos else d.translation)
+                            if not result.meaning_vi:
+                                result.meaning_vi = d.translation
+                            if len(parts) >= 3:
+                                break
+                    if parts:
+                        result.part_of_speech = "; ".join(parts)
+            elif en_entry and en_entry.definitions:
+                if not result.meaning_en:
+                    result.meaning_en = en_entry.definitions[0].definition
+                pos_parts = []
+                for d in en_entry.definitions:
+                    if d.pos and d.pos not in pos_parts:
+                        pos_parts.append(d.pos)
+                result.part_of_speech = ", ".join(pos_parts)
+
+            has_data = result.phonetic or result.audio_url or result.meaning_vi
+            needs_vi = translate_meaning and not result.meaning_vi
+            if has_data and not needs_vi:
+                if not result.audio_url:
+                    from urllib.parse import quote
+                    result.audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(word)}"
+                _dict_cache[cache_key] = (_time.monotonic(), result)
+                if len(_dict_cache) > _DICT_CACHE_MAX:
+                    oldest = min(_dict_cache, key=lambda k: _dict_cache[k][0])
+                    _dict_cache.pop(oldest, None)
+                return result
+
+            # Cambridge English found but no Vietnamese translation — use Gemini for meaning only
+            if en_entry and needs_vi:
+                gemini_result = await _fetch_gemini_dictionary(word)
+                if gemini_result:
+                    if not result.phonetic and gemini_result.phonetic:
+                        result.phonetic = gemini_result.phonetic
+                    parts: list[str] = []
+                    for m in gemini_result.meanings:
+                        pos = m.part_of_speech.lower()
+                        parts.append(f"{pos}: {m.meaning_vi}")
+                        if not result.meaning_en:
+                            result.meaning_en = m.meaning_en
+                        if not result.meaning_vi:
+                            result.meaning_vi = m.meaning_vi
+                    if parts:
+                        result.part_of_speech = "; ".join(parts)
+                if not result.audio_url:
+                    from urllib.parse import quote
+                    result.audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(word)}"
+                _dict_cache[cache_key] = (_time.monotonic(), result)
+                if len(_dict_cache) > _DICT_CACHE_MAX:
+                    oldest = min(_dict_cache, key=lambda k: _dict_cache[k][0])
+                    _dict_cache.pop(oldest, None)
+                return result
+    except Exception as e:
+        logger.warning("Cambridge lookup failed for %r, falling back: %s", word, e)
+
+    # Full fallback: dictionaryapi.dev + Gemini (when Cambridge failed entirely)
     dict_task = _fetch_dictionary_audio_ipa(word)
 
     if translate_meaning:
@@ -358,4 +475,8 @@ async def fetch_dictionary_data(word: str, translate_meaning: bool = True) -> Di
                 result.meaning_vi = m.meaning_vi
         result.part_of_speech = "; ".join(parts)
 
+    _dict_cache[cache_key] = (_time.monotonic(), result)
+    if len(_dict_cache) > _DICT_CACHE_MAX:
+        oldest = min(_dict_cache, key=lambda k: _dict_cache[k][0])
+        _dict_cache.pop(oldest, None)
     return result

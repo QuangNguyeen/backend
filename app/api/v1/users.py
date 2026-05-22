@@ -4,7 +4,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import Date, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from pydantic import BaseModel
+
 from app.api.deps import get_current_user
+from app.core.exceptions import BadRequestError
+from app.core.security import hash_password, verify_password
 from app.database import get_db
 from app.models.dictation import DictationAttempt, DictationSentence
 from app.models.user import User
@@ -112,3 +116,26 @@ async def update_my_profile(
 
     stats = await _build_stats(db, current_user.id)
     return _serialize_profile(current_user, stats)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@router.post("/me/change-password")
+async def change_password(
+    body: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not current_user.password_hash:
+        raise BadRequestError("Account uses social login — set a password via your profile settings")
+    if not verify_password(body.current_password, current_user.password_hash):
+        raise BadRequestError("Current password is incorrect")
+    if len(body.new_password) < 6:
+        raise BadRequestError("New password must be at least 6 characters")
+
+    current_user.password_hash = hash_password(body.new_password)
+    await db.commit()
+    return {"message": "Password changed successfully"}

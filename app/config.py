@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # Gemini
     GEMINI_API_KEY: str = ""
 
+    # AssemblyAI
+    ASSEMBLYAI_API_KEY: str = ""
+
     # Google Cloud (Translation API)
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
 

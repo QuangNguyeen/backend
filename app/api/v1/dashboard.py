@@ -78,6 +78,14 @@ async def get_dashboard(
     )
     total_videos = result.scalar() or 0
 
+    result = await db.execute(
+        select(func.sum(DictationAttempt.duration_seconds)).where(
+            DictationAttempt.user_id == current_user.id,
+            DictationAttempt.status == "completed",
+        )
+    )
+    total_duration_sec = result.scalar() or 0
+
     # ── Heatmap (last 365 days, keyed by activity date) ──────────────────────
 
     result = await db.execute(
@@ -145,7 +153,7 @@ async def get_dashboard(
         stats=DashboardStatsResponse(
             total_sessions=total_sessions,
             total_sentences=total_sentences,
-            total_time_minutes=0,
+            total_time_minutes=round(total_duration_sec / 60, 1),
             average_accuracy=round(avg_accuracy * 100, 1),
             total_videos=total_videos,
             current_streak=current_streak,
@@ -154,6 +162,39 @@ async def get_dashboard(
         heatmap=heatmap,
         accuracy_trend=accuracy_trend,
     )
+
+
+@router.get("/weak-words")
+async def get_weak_words(
+    limit: int = 20,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Aggregate error_summary across completed sessions to find the user's weakest words."""
+    result = await db.execute(
+        select(DictationAttempt.error_summary, DictationAttempt.completed_at).where(
+            DictationAttempt.user_id == current_user.id,
+            DictationAttempt.status == "completed",
+            DictationAttempt.error_summary.is_not(None),
+        )
+    )
+
+    word_agg: dict[str, dict] = {}
+    for error_summary, completed_at in result.all():
+        if not error_summary or "top_words" not in error_summary:
+            continue
+        for entry in error_summary["top_words"]:
+            w = entry["word"]
+            c = entry["count"]
+            if w not in word_agg:
+                word_agg[w] = {"word": w, "count": 0, "last_seen_at": None}
+            word_agg[w]["count"] += c
+            ts = completed_at.isoformat() if completed_at else None
+            if ts and (word_agg[w]["last_seen_at"] is None or ts > word_agg[w]["last_seen_at"]):
+                word_agg[w]["last_seen_at"] = ts
+
+    sorted_words = sorted(word_agg.values(), key=lambda x: x["count"], reverse=True)[:limit]
+    return sorted_words
 
 
 @router.get("/history", response_model=list[HistoryEntryResponse])
