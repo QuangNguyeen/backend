@@ -1,4 +1,7 @@
+import logging
+
 from celery import Celery
+from celery.signals import setup_logging
 
 from app.config import get_settings
 
@@ -23,3 +26,17 @@ celery.conf.update(
 )
 
 celery.conf.include = ["app.tasks.transcription"]
+
+
+@setup_logging.connect
+def configure_worker_logging(**kwargs):
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("[%(asctime)s: %(levelname)s/%(name)s] %(message)s")
+    )
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+    logging.getLogger("app").setLevel(logging.INFO)

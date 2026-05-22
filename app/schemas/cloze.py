@@ -3,7 +3,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 
-PracticeMode = Literal["sentence", "cloze"]
+PracticeMode = Literal["sentence", "cloze", "reorder"]
 ClozeDifficulty = Literal["easy", "medium", "hard"]
 
 

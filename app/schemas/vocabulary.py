@@ -84,3 +84,8 @@ class WordPreviewResponse(BaseModel):
     context_translation: str | None = None
     is_saved: bool = False
     part_of_speech: str | None = None
+
+
+class BatchPreviewRequest(BaseModel):
+    words: list[str]
+    context: str | None = None

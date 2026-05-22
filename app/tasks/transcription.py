@@ -1,4 +1,5 @@
 import logging
+import time
 
 from sqlalchemy import create_engine, select, update
 from sqlalchemy.orm import Session
@@ -6,7 +7,8 @@ from sqlalchemy.orm import Session
 from app.celery_app import celery
 from app.config import get_settings
 from app.models.video import Transcript, Video
-from app.services.google_stt_service import transcribe_youtube_video
+# from app.services.google_stt_service import transcribe_with_gemini  # OLD: Gemini STT
+from app.services.assemblyai_service import transcribe_with_assemblyai
 from app.services.level_service import analyze_level, estimate_cefr_with_speech_rate
 from app.services import youtube_service
 
@@ -32,12 +34,19 @@ def run_stt_pipeline(
     video_duration: int,
     max_segment_duration: float = 10.0,
 ):
-    """Run the full STT + Gemini pipeline in a Celery worker.
+    """Run the AssemblyAI STT pipeline in a Celery worker.
 
     Updates the video's transcription_status through:
       pending → processing → ready | failed
     """
+    pipeline_t0 = time.time()
     engine = _get_sync_engine()
+
+    logger.info(
+        "[CELERY] ▶ Task started for youtube=%s (db=%s, lang=%s, duration=%ds, retry=%d/%d)",
+        youtube_id, video_db_id, language, video_duration,
+        self.request.retries, self.max_retries,
+    )
 
     with Session(engine) as db:
         db.execute(
@@ -46,10 +55,16 @@ def run_stt_pipeline(
             .values(transcription_status="processing")
         )
         db.commit()
+    logger.info("[CELERY] Status → processing for %s", youtube_id)
 
     try:
-        lang_code = language if "-" in language else f"{language}-US"
-        stt_segments = transcribe_youtube_video(youtube_id, lang_code, video_duration)
+        logger.info("[CELERY] Calling transcribe_with_assemblyai for %s...", youtube_id)
+        stt_t0 = time.time()
+        stt_segments = transcribe_with_assemblyai(youtube_id, language, video_duration)
+        logger.info(
+            "[CELERY] AssemblyAI returned %d segments in %.1fs for %s",
+            len(stt_segments) if stt_segments else 0, time.time() - stt_t0, youtube_id,
+        )
 
         if not stt_segments:
             logger.error("[CELERY] STT pipeline returned empty for %s", youtube_id)
@@ -64,7 +79,8 @@ def run_stt_pipeline(
                 logger.warning("[CELERY] Video %s was deleted during STT, aborting", video_db_id)
                 return {"status": "aborted", "video_id": video_db_id}
 
-            db.query(Transcript).filter(Transcript.video_id == video_db_id).delete()
+            old_count = db.query(Transcript).filter(Transcript.video_id == video_db_id).delete()
+            logger.info("[CELERY] Deleted %d old transcripts for %s", old_count, youtube_id)
 
             for idx, seg in enumerate(stt_segments):
                 db.add(Transcript(
@@ -88,14 +104,15 @@ def run_stt_pipeline(
                 .values(
                     transcription_status="ready",
                     level=level,
-                    is_auto_generated=True,
+                    is_auto_generated=False,
                 )
             )
             db.commit()
 
+        elapsed = time.time() - pipeline_t0
         logger.info(
-            "[CELERY] STT pipeline complete for %s: %d segments, level=%s",
-            youtube_id, len(stt_segments), level,
+            "[CELERY] ✔ Pipeline complete for %s: %d segments, level=%s, total=%.1fs",
+            youtube_id, len(stt_segments), level, elapsed,
         )
         return {
             "status": "ready",
@@ -105,9 +122,16 @@ def run_stt_pipeline(
         }
 
     except Exception as exc:
-        logger.error("[CELERY] STT pipeline failed for %s: %s", youtube_id, exc, exc_info=True)
+        elapsed = time.time() - pipeline_t0
+        logger.error(
+            "[CELERY] ✘ Pipeline failed for %s after %.1fs (retry %d/%d): %s",
+            youtube_id, elapsed, self.request.retries, self.max_retries, exc,
+            exc_info=True,
+        )
         _mark_failed(video_db_id, str(exc))
-        raise self.retry(exc=exc, countdown=30) if self.request.retries < self.max_retries else exc
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=exc, countdown=30)
+        raise
 
 
 def _mark_failed(video_db_id: str, error_msg: str):
@@ -122,3 +146,4 @@ def _mark_failed(video_db_id: str, error_msg: str):
             )
         )
         db.commit()
+    logger.info("[CELERY] Status → failed for %s: %s", video_db_id, error_msg[:100])

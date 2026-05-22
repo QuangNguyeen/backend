@@ -43,6 +43,46 @@ class AttemptStatus(str, Enum):
     in_progress = "in-progress"
     completed = "completed"
 
+
+def _populate_analytics(attempt: DictationAttempt, all_sentences: list[DictationSentence]):
+    """Fill duration_seconds, error_summary, total_words, correct_words on completion."""
+    if attempt.created_at and attempt.completed_at:
+        delta = attempt.completed_at - attempt.created_at
+        attempt.duration_seconds = int(delta.total_seconds())
+
+    total_correct = 0
+    total_wrong = 0
+    total_missing = 0
+    word_error_counts: dict[str, int] = {}
+
+    for sentence in all_sentences:
+        if not sentence.word_diff:
+            continue
+        for item in sentence.word_diff:
+            status = item.get("status", "")
+            if status == "correct":
+                total_correct += 1
+            elif status in ("wrong", "missing"):
+                if status == "wrong":
+                    total_wrong += 1
+                else:
+                    total_missing += 1
+                word = item.get("expected") or item.get("word") or ""
+                word = word.strip().lower()
+                if word:
+                    word_error_counts[word] = word_error_counts.get(word, 0) + 1
+
+    total_words = total_correct + total_wrong + total_missing
+    attempt.total_words = total_words
+    attempt.correct_words = total_correct
+
+    top_words = sorted(word_error_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    attempt.error_summary = {
+        "top_words": [{"word": w, "count": c} for w, c in top_words],
+        "total_wrong": total_wrong,
+        "total_missing": total_missing,
+    }
+
 router = APIRouter(prefix="/dictation", tags=["Dictation"])
 
 
@@ -190,9 +230,11 @@ async def submit_answer(
     if not transcript:
         raise NotFoundError("Transcript segment not found")
 
-    # Handle skipped sentences — no word diff, score = 0
+    # Handle skipped sentences — mark all correct words as "missing" so the
+    # frontend can display the answer when the user revisits this sentence.
     if body.skipped:
-        diffs = []
+        correct_words = transcript.text.strip().split()
+        diffs = [WordDiffItem(word=w, status="missing") for w in correct_words]
         final_score = 0.0
     else:
         diffs, score = compute_word_diff(body.user_input, transcript.text)
@@ -243,22 +285,24 @@ async def submit_answer(
         attempt.score = sum(scores) / len(scores) if scores else 0.0
         attempt.status = "completed"
         attempt.completed_at = datetime.now(timezone.utc)
+        _populate_analytics(attempt, list(all_sentences))
 
     await db.commit()
 
     if body.skipped:
+        difficulty_map = get_word_difficulty_map(transcript.text, language=transcript.language)
         return SentenceResultResponse(
             sentence_index=body.sentence_index,
             score=0.0,
-            word_diffs=[],
+            word_diffs=diffs,
             correct_count=0,
             wrong_count=0,
-            missing_count=0,
+            missing_count=len(diffs),
             is_skipped=True,
             original_text=transcript.text,
             video_id=attempt.video_id,
             audio_start_time=transcript.start_time,
-            word_difficulty={},
+            word_difficulty=difficulty_map,
         )
 
     correct = sum(1 for d in diffs if d.status == "correct")
@@ -311,6 +355,7 @@ async def complete_session(
     attempt.status = "completed"
     attempt.completed_at = datetime.now(timezone.utc)
     attempt.current_sentence_index = attempt.total_sentences or len(all_sentences)
+    _populate_analytics(attempt, list(all_sentences))
     await db.commit()
 
     return {"status": "completed", "score": round(attempt.score * 100, 1)}
@@ -323,6 +368,10 @@ PAGE_SIZE = 20
 async def get_history(
     status: AttemptStatus,
     page: int = Query(1, ge=1),
+    video_id: str | None = Query(None),
+    practice_mode: str | None = Query(None),
+    from_date: str | None = Query(None, description="ISO date, e.g. 2026-01-01"),
+    to_date: str | None = Query(None, description="ISO date, e.g. 2026-12-31"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -334,6 +383,17 @@ async def get_history(
         DictationAttempt.user_id == current_user.id,
         DictationAttempt.status == db_status,
     ]
+
+    if video_id:
+        base_filter.append(DictationAttempt.video_id == video_id)
+    if practice_mode:
+        base_filter.append(DictationAttempt.practice_mode == practice_mode)
+    if from_date:
+        from datetime import datetime as _dt
+        base_filter.append(DictationAttempt.created_at >= _dt.fromisoformat(from_date))
+    if to_date:
+        from datetime import datetime as _dt
+        base_filter.append(DictationAttempt.created_at <= _dt.fromisoformat(to_date + "T23:59:59"))
 
     # Count total
     count_q = select(sa_func.count()).select_from(DictationAttempt).where(*base_filter)
@@ -369,6 +429,8 @@ async def get_history(
                 progress_str=progress_str,
                 video_title=video_title,
                 video_thumbnail=video_thumbnail or "",
+                practice_mode=attempt.practice_mode or "sentence",
+                duration_seconds=attempt.duration_seconds,
                 error_summary=attempt.error_summary,
                 updated_at=attempt.updated_at.isoformat(),
                 completed_at=attempt.completed_at.isoformat() if attempt.completed_at else None,
@@ -381,6 +443,46 @@ async def get_history(
         page=page,
         total_pages=total_pages,
     )
+
+
+@router.get("/attempts-summary")
+async def get_attempts_summary(
+    video_id: str | None = Query(None),
+    practice_mode: str | None = Query(None),
+    from_date: str | None = Query(None),
+    to_date: str | None = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Aggregate stats for the history page: total sessions, total time, avg score."""
+    base_filter = [
+        DictationAttempt.user_id == current_user.id,
+        DictationAttempt.status == "completed",
+    ]
+    if video_id:
+        base_filter.append(DictationAttempt.video_id == video_id)
+    if practice_mode:
+        base_filter.append(DictationAttempt.practice_mode == practice_mode)
+    if from_date:
+        from datetime import datetime as _dt
+        base_filter.append(DictationAttempt.created_at >= _dt.fromisoformat(from_date))
+    if to_date:
+        from datetime import datetime as _dt
+        base_filter.append(DictationAttempt.created_at <= _dt.fromisoformat(to_date + "T23:59:59"))
+
+    result = await db.execute(
+        select(
+            sa_func.count(),
+            sa_func.coalesce(sa_func.sum(DictationAttempt.duration_seconds), 0),
+            sa_func.coalesce(sa_func.avg(DictationAttempt.score), 0),
+        ).where(*base_filter)
+    )
+    row = result.one()
+    return {
+        "total_sessions": row[0],
+        "total_duration_seconds": row[1],
+        "average_score": round(float(row[2]) * 100, 1),
+    }
 
 
 # ─── Cloze (paragraph fill-in-the-blanks) ─────────────────────────────────────
@@ -507,6 +609,7 @@ async def submit_cloze(
         attempt.score = sum(scores) / len(scores) if scores else 0.0
         attempt.status = "completed"
         attempt.completed_at = datetime.now(timezone.utc)
+        _populate_analytics(attempt, list(all_sentences))
 
     await db.commit()
 
@@ -598,6 +701,11 @@ async def submit_cloze_all(
     attempt.status = "completed"
     attempt.completed_at = datetime.now(timezone.utc)
     attempt.current_sentence_index = attempt.total_sentences or 0
+
+    cloze_sentences = (await db.execute(
+        select(DictationSentence).where(DictationSentence.attempt_id == session_id)
+    )).scalars().all()
+    _populate_analytics(attempt, list(cloze_sentences))
     await db.commit()
 
     return ClozeSubmitAllResponse(
@@ -606,4 +714,265 @@ async def submit_cloze_all(
         total_count=len(expected),
         results=results,
         segment_scores=segment_scores,
+    )
+
+
+# ─── Sentence Reorder ────────────────────────────────────────────────────────
+
+
+import random
+import re
+
+from app.schemas.reorder import (
+    ReorderToken,
+    ReorderChallenge,
+    ReorderChallengesResponse,
+    ReorderSubmitRequest,
+    ReorderSentenceResult,
+    ReorderTokenResult,
+    ReorderSubmitAllRequest,
+    ReorderSubmitAllResponse,
+)
+
+
+_PUNCT_RE = re.compile(r"""^[.,!?;:'"()\[\]{}\-—–…]+$""")
+
+
+def _tokenize_for_reorder(text: str) -> list[str]:
+    """Split text into tokens, attaching trailing punctuation to the preceding word.
+
+    "Hello, world!" → ["Hello,", "world!"]
+    This keeps punctuation with its word so the user drags meaningful units.
+    """
+    raw = text.strip().split()
+    merged: list[str] = []
+    for tok in raw:
+        if merged and _PUNCT_RE.match(tok):
+            merged[-1] += tok
+        else:
+            merged.append(tok)
+    return merged
+
+
+def _shuffle_tokens(tokens: list[str]) -> list[str]:
+    """Return a shuffled copy that is guaranteed to differ from the original
+    (when there are ≥2 distinct tokens)."""
+    shuffled = tokens[:]
+    distinct = len(set(tokens))
+    if distinct < 2:
+        return shuffled
+    for _ in range(20):
+        random.shuffle(shuffled)
+        if shuffled != tokens:
+            return shuffled
+    return shuffled
+
+
+def _score_reorder(submitted: list[str], expected: list[str]) -> tuple[float, list[ReorderTokenResult]]:
+    """Score by comparing token positions. Returns (score, per-token results)."""
+    results: list[ReorderTokenResult] = []
+    correct = 0
+    for i, exp in enumerate(expected):
+        got = submitted[i] if i < len(submitted) else ""
+        is_correct = got.strip().lower() == exp.strip().lower()
+        if is_correct:
+            correct += 1
+        results.append(ReorderTokenResult(
+            index=i,
+            token=got,
+            expected=exp,
+            is_correct=is_correct,
+        ))
+    score = correct / len(expected) if expected else 1.0
+    return score, results
+
+
+@router.get(
+    "/sessions/{session_id}/reorder-challenges",
+    response_model=ReorderChallengesResponse,
+)
+async def get_reorder_challenges(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return shuffled tokens for each transcript sentence in the session."""
+    attempt = await _load_attempt(session_id, current_user.id, db)
+    transcripts = await _load_transcripts(attempt.video_id, db)
+
+    challenges: list[ReorderChallenge] = []
+    for idx, t in enumerate(transcripts):
+        tokens = _tokenize_for_reorder(t.text)
+        shuffled = _shuffle_tokens(tokens)
+        challenges.append(ReorderChallenge(
+            sentence_index=idx,
+            start_time=t.start_time,
+            end_time=t.end_time,
+            shuffled_tokens=[
+                ReorderToken(index=i, text=s) for i, s in enumerate(shuffled)
+            ],
+            token_count=len(tokens),
+        ))
+
+    return ReorderChallengesResponse(
+        total_sentences=len(challenges),
+        challenges=challenges,
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/reorder-submit",
+    response_model=ReorderSentenceResult,
+)
+async def submit_reorder(
+    session_id: str,
+    body: ReorderSubmitRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Score a single reordered sentence and persist progress."""
+    attempt = await _load_attempt(session_id, current_user.id, db)
+    transcripts = await _load_transcripts(attempt.video_id, db)
+
+    if body.sentence_index < 0 or body.sentence_index >= len(transcripts):
+        raise BadRequestError("sentence_index out of range")
+
+    transcript = transcripts[body.sentence_index]
+    expected_tokens = _tokenize_for_reorder(transcript.text)
+    score, token_results = _score_reorder(body.ordered_tokens, expected_tokens)
+
+    word_diff_payload = [r.model_dump() for r in token_results]
+    user_input_joined = " ".join(body.ordered_tokens)
+
+    existing = (await db.execute(
+        select(DictationSentence).where(
+            DictationSentence.attempt_id == session_id,
+            DictationSentence.sentence_index == body.sentence_index,
+        )
+    )).scalar_one_or_none()
+
+    if existing:
+        existing.user_input = user_input_joined
+        existing.original_text = transcript.text
+        existing.score = score
+        existing.word_diff = word_diff_payload
+    else:
+        db.add(DictationSentence(
+            attempt_id=session_id,
+            sentence_index=body.sentence_index,
+            user_input=user_input_joined,
+            original_text=transcript.text,
+            score=score,
+            word_diff=word_diff_payload,
+        ))
+
+    new_index = body.sentence_index + 1
+    if new_index > attempt.current_sentence_index:
+        attempt.current_sentence_index = new_index
+
+    if attempt.total_sentences and attempt.current_sentence_index >= attempt.total_sentences:
+        from datetime import datetime, timezone
+
+        all_sentences = (await db.execute(
+            select(DictationSentence).where(DictationSentence.attempt_id == session_id)
+        )).scalars().all()
+        scores = [s.score for s in all_sentences if s.score is not None]
+        attempt.score = sum(scores) / len(scores) if scores else 0.0
+        attempt.status = "completed"
+        attempt.completed_at = datetime.now(timezone.utc)
+        _populate_analytics(attempt, list(all_sentences))
+
+    await db.commit()
+
+    return ReorderSentenceResult(
+        sentence_index=body.sentence_index,
+        score=score,
+        token_results=token_results,
+        correct_order=expected_tokens,
+        start_time=transcript.start_time,
+        end_time=transcript.end_time,
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/reorder-submit-all",
+    response_model=ReorderSubmitAllResponse,
+)
+async def submit_reorder_all(
+    session_id: str,
+    body: ReorderSubmitAllRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Score ALL reordered sentences at once and mark session completed."""
+    from datetime import datetime, timezone
+
+    attempt = await _load_attempt(session_id, current_user.id, db)
+    transcripts = await _load_transcripts(attempt.video_id, db)
+
+    sentence_results: list[ReorderSentenceResult] = []
+    total_correct = 0
+    total_tokens = 0
+
+    for idx, t in enumerate(transcripts):
+        expected_tokens = _tokenize_for_reorder(t.text)
+        submitted = body.answers[idx] if idx < len(body.answers) else []
+        score, token_results = _score_reorder(submitted, expected_tokens)
+
+        correct_in_sentence = sum(1 for r in token_results if r.is_correct)
+        total_correct += correct_in_sentence
+        total_tokens += len(expected_tokens)
+
+        word_diff_payload = [r.model_dump() for r in token_results]
+        user_input_joined = " ".join(submitted)
+
+        existing = (await db.execute(
+            select(DictationSentence).where(
+                DictationSentence.attempt_id == session_id,
+                DictationSentence.sentence_index == idx,
+            )
+        )).scalar_one_or_none()
+
+        if existing:
+            existing.user_input = user_input_joined
+            existing.original_text = t.text
+            existing.score = score
+            existing.word_diff = word_diff_payload
+        else:
+            db.add(DictationSentence(
+                attempt_id=session_id,
+                sentence_index=idx,
+                user_input=user_input_joined,
+                original_text=t.text,
+                score=score,
+                word_diff=word_diff_payload,
+            ))
+
+        sentence_results.append(ReorderSentenceResult(
+            sentence_index=idx,
+            score=score,
+            token_results=token_results,
+            correct_order=expected_tokens,
+            start_time=t.start_time,
+            end_time=t.end_time,
+        ))
+
+    overall_score = total_correct / total_tokens if total_tokens else 1.0
+
+    attempt.score = overall_score
+    attempt.status = "completed"
+    attempt.completed_at = datetime.now(timezone.utc)
+    attempt.current_sentence_index = len(transcripts)
+
+    all_sentences = (await db.execute(
+        select(DictationSentence).where(DictationSentence.attempt_id == session_id)
+    )).scalars().all()
+    _populate_analytics(attempt, list(all_sentences))
+    await db.commit()
+
+    return ReorderSubmitAllResponse(
+        score=overall_score,
+        correct_count=total_correct,
+        total_count=total_tokens,
+        sentence_results=sentence_results,
     )

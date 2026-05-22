@@ -1,6 +1,8 @@
 import logging
 
-from fastapi import APIRouter, Depends, Response
+import math
+
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import delete, select, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +11,7 @@ from app.api.deps import get_current_user
 from app.core.exceptions import BadRequestError, ConflictError, ForbiddenError, NotFoundError
 from app.database import get_db
 from app.models.dictation import DictationAttempt, DictationSentence
+from app.models.room import RoomSession
 from app.models.user import User
 from app.models.video import Transcript, Video
 from app.schemas.video import (
@@ -32,94 +35,18 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/videos", tags=["Videos"])
 
-
-def _redistribute_punctuated_text(
-    punctuated_text: str,
-    original_segments: list[youtube_service.TranscriptSegment],
-) -> list[youtube_service.TranscriptSegment]:
-    """Map Gemini-punctuated text back onto original segment timestamps.
-
-    Strategy: Instead of rigid per-segment word mapping, we use a
-    proportional approach. We calculate the overall word-position ratio
-    and map each punctuated word back to the closest original segment's
-    time range. This tolerates word-count drift from Gemini without
-    losing segments or creating time gaps.
-    """
-    if not original_segments or not punctuated_text.strip():
-        return original_segments
-
-    punct_words = punctuated_text.split()
-    total_punct_words = len(punct_words)
-    if total_punct_words == 0:
-        return original_segments
-
-    word_timestamps: list[tuple[float, float]] = []
-    for seg in original_segments:
-        seg_wc = len(seg.text.split())
-        if seg_wc == 0:
-            continue
-        word_duration = seg.duration / seg_wc
-        for w_idx in range(seg_wc):
-            w_start = seg.start + w_idx * word_duration
-            w_end = w_start + word_duration
-            word_timestamps.append((w_start, w_end))
-
-    total_orig_words = len(word_timestamps)
-    if total_orig_words == 0:
-        return original_segments
-
-    result_segments: list[youtube_service.TranscriptSegment] = []
-    current_words: list[str] = []
-    current_start: float | None = None
-    current_end: float = 0.0
-
-    for p_idx, word in enumerate(punct_words):
-        orig_idx = int(p_idx * total_orig_words / total_punct_words)
-        orig_idx = min(orig_idx, total_orig_words - 1)
-
-        w_start, w_end = word_timestamps[orig_idx]
-
-        if current_start is None:
-            current_start = w_start
-
-        current_words.append(word)
-        current_end = w_end
-
-        stripped = word.rstrip()
-        if stripped and stripped[-1] in ".?!":
-            result_segments.append(youtube_service.TranscriptSegment(
-                text=" ".join(current_words),
-                start=current_start,
-                duration=current_end - current_start,
-            ))
-            current_words = []
-            current_start = None
-
-    if current_words and current_start is not None:
-        result_segments.append(youtube_service.TranscriptSegment(
-            text=" ".join(current_words),
-            start=current_start,
-            duration=current_end - current_start,
-        ))
-
-    if not result_segments:
-        return original_segments
-
-    logger.warning(
-        "Redistributed punctuated text: %d orig segments → %d sentences",
-        len(original_segments), len(result_segments),
-    )
-    return result_segments
+MAX_GEMINI_STT_DURATION = 300
 
 
-@router.get("", response_model=list[VideoResponse])
+@router.get("")
 async def list_videos(
     language: str | None = None,
     level: str | None = None,
     curated: bool | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
-    # Subquery for play_count and best_score per video
     stats_sub = (
         select(
             DictationAttempt.video_id,
@@ -130,7 +57,7 @@ async def list_videos(
         .subquery()
     )
 
-    query = (
+    base = (
         select(
             Video,
             func.coalesce(stats_sub.c.play_count, 0).label("play_count"),
@@ -140,13 +67,24 @@ async def list_videos(
         .where(Video.is_active == True)  # noqa: E712
     )
     if language:
-        query = query.where(Video.language == language)
+        base = base.where(Video.language == language)
     if level:
-        query = query.where(Video.level == level)
+        base = base.where(Video.level == level)
     if curated is not None:
-        query = query.where(Video.is_curated == curated)
+        base = base.where(Video.is_curated == curated)
 
-    result = await db.execute(query.order_by(Video.created_at.desc()))
+    count_q = select(func.count()).select_from(Video).where(Video.is_active == True)  # noqa: E712
+    if language:
+        count_q = count_q.where(Video.language == language)
+    if level:
+        count_q = count_q.where(Video.level == level)
+    if curated is not None:
+        count_q = count_q.where(Video.is_curated == curated)
+    total = (await db.execute(count_q)).scalar() or 0
+    total_pages = max(1, math.ceil(total / page_size))
+
+    query = base.order_by(Video.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    result = await db.execute(query)
     videos = []
     for row in result.all():
         video = row[0]
@@ -154,7 +92,7 @@ async def list_videos(
         resp.play_count = row[1] or 0
         resp.best_score = round(row[2] * 100, 1) if row[2] is not None else None
         videos.append(resp)
-    return videos
+    return {"items": videos, "total": total, "page": page, "total_pages": total_pages}
 
 
 @router.post("/import", response_model=VideoResponse, status_code=201,
@@ -165,37 +103,34 @@ async def import_video(
     db: AsyncSession = Depends(get_db),
 ):
     """Import a YouTube video and extract its transcript for dictation practice."""
+    import asyncio
     from fastapi.responses import JSONResponse
 
-    # Extract video ID from URL
     video_id = youtube_service.extract_video_id(body.youtube_url)
 
-    # Check if video already exists
     existing = await db.execute(
         select(Video).where(Video.youtube_id == video_id)
     )
     if existing.scalar_one_or_none():
         raise ConflictError(f"Video {video_id} already imported")
 
-    # ── Phase 1: External API calls (no DB writes) ─────────────────────────
+    # ── Phase 1: External API calls — run sync I/O in thread pool ─────────
 
-    # 1. Metadata (oEmbed → yt-dlp → defaults)
     metadata = {"title": "", "channel": "", "duration": 0, "thumbnail_url": ""}
     if not body.title or not body.channel:
         try:
-            metadata = youtube_service.get_video_metadata(video_id)
+            metadata = await asyncio.to_thread(youtube_service.get_video_metadata, video_id)
         except Exception as e:
             logger.error("Metadata fetch failed for %s: %s", video_id, e, exc_info=True)
 
     resolved_title = body.title or metadata.get("title") or f"YouTube Video {video_id}"
     resolved_thumbnail = metadata.get("thumbnail_url") or f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
-    # 2. Transcript — Layer 1: youtube-transcript-api
     segments = None
     transcript_error = None
 
     try:
-        segments = youtube_service.get_transcript(video_id, languages=body.languages)
+        segments = await asyncio.to_thread(youtube_service.get_transcript, video_id, body.languages)
         logger.info("Transcript for %s fetched via youtube-transcript-api", video_id)
     except TranscriptsDisabled as e:
         logger.error("Layer 1 failed — TranscriptsDisabled for %s: %s", video_id, e)
@@ -207,11 +142,10 @@ async def import_video(
         logger.error("Layer 1 failed — %s for %s: %s", type(e).__name__, video_id, e, exc_info=True)
         transcript_error = e
 
-    # 2b. Transcript — Layer 2: yt-dlp --write-auto-subs
     if segments is None:
         logger.info("Attempting yt-dlp subtitle fallback for %s", video_id)
         try:
-            segments = youtube_service.get_transcript_ytdlp(video_id, languages=body.languages)
+            segments = await asyncio.to_thread(youtube_service.get_transcript_ytdlp, video_id, body.languages)
             transcript_error = None
         except Exception as e:
             logger.error("Layer 2 failed — yt-dlp subtitle fallback for %s: %s", video_id, e, exc_info=True)
@@ -289,17 +223,14 @@ async def import_video(
     else:
         is_auto_generated = False
 
-    MAX_AUTO_GEN_DURATION = 300
-    if is_auto_generated and video_duration > MAX_AUTO_GEN_DURATION:
-        raise BadRequestError(
-            f"Videos with auto-generated subtitles are limited to "
-            f"{MAX_AUTO_GEN_DURATION // 60} minutes. "
-            f"This video is {video_duration // 60}m {video_duration % 60}s. "
-            f"Please choose a shorter video or one with manually uploaded subtitles."
+    # Dispatch Gemini STT for auto-gen captions (within duration limit) or no captions
+    dispatch_stt = dispatch_stt_layer3
+    if is_auto_generated and segments and video_duration <= MAX_GEMINI_STT_DURATION:
+        dispatch_stt = True
+        logger.info(
+            "Auto-gen captions detected for %s — dispatching Gemini STT (duration=%ds)",
+            video_id, video_duration,
         )
-
-    # Determine whether to dispatch async STT upgrade via Celery
-    dispatch_stt = dispatch_stt_layer3 or (is_auto_generated and video_duration <= MAX_AUTO_GEN_DURATION)
 
     video = Video(
         youtube_id=video_id,
@@ -526,6 +457,11 @@ async def delete_video(
         delete(DictationAttempt).where(DictationAttempt.video_id == video_id)
     )
 
+    # Delete room sessions referencing this video (members/answers cascade)
+    await db.execute(
+        delete(RoomSession).where(RoomSession.video_id == video_id)
+    )
+
     # Delete video (transcripts cascade automatically via relationship)
     await db.delete(video)
     await db.commit()
@@ -552,8 +488,9 @@ async def refresh_transcript(
     if video.created_by != current_user.id and not current_user.is_admin:
         raise ForbiddenError("You can only refresh videos you created")
 
-    # Re-fetch metadata (never raises)
-    metadata = youtube_service.get_video_metadata(video.youtube_id)
+    import asyncio
+
+    metadata = await asyncio.to_thread(youtube_service.get_video_metadata, video.youtube_id)
     if metadata.get("title"):
         video.title = metadata["title"]
     if metadata.get("channel"):
@@ -563,14 +500,12 @@ async def refresh_transcript(
     if metadata.get("duration"):
         video.duration = metadata["duration"]
 
-    # Delete old transcripts
     await db.execute(
         delete(Transcript).where(Transcript.video_id == video_id)
     )
 
-    # Re-fetch transcript from YouTube
     try:
-        segments = youtube_service.get_transcript(video.youtube_id)
+        segments = await asyncio.to_thread(youtube_service.get_transcript, video.youtube_id)
     except TranscriptsDisabled:
         raise BadRequestError(f"Transcripts are disabled for video: {video.youtube_id}")
     except VideoUnavailable:
@@ -597,16 +532,15 @@ async def refresh_transcript(
         refresh_is_auto = False
     video.is_auto_generated = refresh_is_auto
 
-    MAX_AUTO_GEN_DURATION = 300
-    if refresh_is_auto and video.duration and video.duration > MAX_AUTO_GEN_DURATION:
+    if refresh_is_auto and video.duration and video.duration > MAX_GEMINI_STT_DURATION:
         raise BadRequestError(
             f"Videos with auto-generated subtitles are limited to "
-            f"{MAX_AUTO_GEN_DURATION // 60} minutes. "
+            f"{MAX_GEMINI_STT_DURATION // 60} minutes. "
             f"This video is {video.duration // 60}m {video.duration % 60}s. "
             f"Please choose a shorter video or one with manually uploaded subtitles."
         )
 
-    dispatch_stt_refresh = refresh_is_auto and video.duration and video.duration <= MAX_AUTO_GEN_DURATION
+    dispatch_stt_refresh = refresh_is_auto and video.duration and video.duration <= MAX_GEMINI_STT_DURATION
 
     if dispatch_stt_refresh:
         video.transcription_status = "pending"

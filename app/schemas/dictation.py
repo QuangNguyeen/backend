@@ -87,6 +87,8 @@ class HistoryAttemptResponse(BaseModel):
     progress_str: str  # e.g. "5/10"
     video_title: str
     video_thumbnail: str
+    practice_mode: str = "sentence"
+    duration_seconds: int | None = None
     error_summary: dict | None = None
     updated_at: str
     completed_at: str | None = None
