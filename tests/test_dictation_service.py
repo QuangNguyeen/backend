@@ -27,17 +27,17 @@ class TestComputeWordDiff:
 
     def test_extra_words(self):
         diffs, score = compute_word_diff("hello world extra", "hello world")
-        # "hello" correct, "world" correct, "extra" is wrong (no expected)
+        # "hello" correct, "world" correct, "extra" is extra (no expected)
         assert score == 1.0  # score = correct / len(correct_words) = 2/2
-        wrong = [d for d in diffs if d.status == "wrong"]
-        assert len(wrong) == 1
-        assert wrong[0].expected == ""
+        extra = [d for d in diffs if d.status == "extra"]
+        assert len(extra) == 1
+        assert extra[0].expected == ""
 
     def test_partial_correct(self):
         diffs, score = compute_word_diff("the quick fox", "the slow fox")
         assert score == round(2 / 3, 4)
         assert diffs[0].status == "correct"  # "the"
-        assert diffs[1].status == "wrong"    # "quick" vs "slow"
+        assert diffs[1].status == "wrong"  # "quick" vs "slow"
         assert diffs[1].expected == "slow"
         assert diffs[2].status == "correct"  # "fox"
 

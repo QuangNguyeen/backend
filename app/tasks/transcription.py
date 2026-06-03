@@ -1,5 +1,6 @@
 import logging
 import time
+from datetime import UTC, datetime
 
 from sqlalchemy import create_engine, select, update
 from sqlalchemy.orm import Session
@@ -7,10 +8,10 @@ from sqlalchemy.orm import Session
 from app.celery_app import celery
 from app.config import get_settings
 from app.models.video import Transcript, Video
+
 # from app.services.google_stt_service import transcribe_with_gemini  # OLD: Gemini STT
 from app.services.assemblyai_service import transcribe_with_assemblyai
-from app.services.level_service import analyze_level, estimate_cefr_with_speech_rate
-from app.services import youtube_service
+from app.services.level_service import calculate_audio_difficulty, difficulty_update_values
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +45,17 @@ def run_stt_pipeline(
 
     logger.info(
         "[CELERY] ▶ Task started for youtube=%s (db=%s, lang=%s, duration=%ds, retry=%d/%d)",
-        youtube_id, video_db_id, language, video_duration,
-        self.request.retries, self.max_retries,
+        youtube_id,
+        video_db_id,
+        language,
+        video_duration,
+        self.request.retries,
+        self.max_retries,
     )
 
     with Session(engine) as db:
         db.execute(
-            update(Video)
-            .where(Video.id == video_db_id)
-            .values(transcription_status="processing")
+            update(Video).where(Video.id == video_db_id).values(transcription_status="processing")
         )
         db.commit()
     logger.info("[CELERY] Status → processing for %s", youtube_id)
@@ -63,7 +66,9 @@ def run_stt_pipeline(
         stt_segments = transcribe_with_assemblyai(youtube_id, language, video_duration)
         logger.info(
             "[CELERY] AssemblyAI returned %d segments in %.1fs for %s",
-            len(stt_segments) if stt_segments else 0, time.time() - stt_t0, youtube_id,
+            len(stt_segments) if stt_segments else 0,
+            time.time() - stt_t0,
+            youtube_id,
         )
 
         if not stt_segments:
@@ -83,20 +88,25 @@ def run_stt_pipeline(
             logger.info("[CELERY] Deleted %d old transcripts for %s", old_count, youtube_id)
 
             for idx, seg in enumerate(stt_segments):
-                db.add(Transcript(
-                    video_id=video_db_id,
-                    language=language,
-                    index=idx,
-                    text=seg.text,
-                    start_time=seg.start,
-                    end_time=seg.end,
-                ))
+                db.add(
+                    Transcript(
+                        video_id=video_db_id,
+                        language=language,
+                        index=idx,
+                        text=seg.text,
+                        start_time=seg.start,
+                        end_time=seg.end,
+                    )
+                )
 
-            full_text = youtube_service.get_full_text(stt_segments)
-            if language == "en" and video_duration > 0:
-                level = estimate_cefr_with_speech_rate(full_text, duration_seconds=video_duration, language=language)
-            else:
-                level = analyze_level(full_text, language=language)
+            difficulty = calculate_audio_difficulty(
+                None,
+                stt_segments,
+                options={"duration_seconds": video_duration, "language": language},
+            )
+            level = difficulty["level"]
+            difficulty_values = difficulty_update_values(difficulty)
+            difficulty_values["difficulty_updated_at"] = datetime.now(UTC)
 
             db.execute(
                 update(Video)
@@ -105,6 +115,7 @@ def run_stt_pipeline(
                     transcription_status="ready",
                     level=level,
                     is_auto_generated=False,
+                    **difficulty_values,
                 )
             )
             db.commit()
@@ -112,7 +123,10 @@ def run_stt_pipeline(
         elapsed = time.time() - pipeline_t0
         logger.info(
             "[CELERY] ✔ Pipeline complete for %s: %d segments, level=%s, total=%.1fs",
-            youtube_id, len(stt_segments), level, elapsed,
+            youtube_id,
+            len(stt_segments),
+            level,
+            elapsed,
         )
         return {
             "status": "ready",
@@ -125,7 +139,11 @@ def run_stt_pipeline(
         elapsed = time.time() - pipeline_t0
         logger.error(
             "[CELERY] ✘ Pipeline failed for %s after %.1fs (retry %d/%d): %s",
-            youtube_id, elapsed, self.request.retries, self.max_retries, exc,
+            youtube_id,
+            elapsed,
+            self.request.retries,
+            self.max_retries,
+            exc,
             exc_info=True,
         )
         _mark_failed(video_db_id, str(exc))

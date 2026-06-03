@@ -1,5 +1,5 @@
-from pathlib import Path
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings
 
@@ -22,7 +22,11 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # CORS
-    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"]
+    CORS_ORIGINS: list[str] = [
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:3000",
+    ]
 
     # YouTube
     YOUTUBE_API_KEY: str = ""
@@ -59,7 +63,9 @@ class Settings(BaseSettings):
     # Sync DB URL for Celery workers (replace asyncpg with psycopg2)
     @property
     def DATABASE_URL_SYNC(self) -> str:
-        return self.DATABASE_URL.replace("+asyncpg", "+psycopg2").replace("postgresql+psycopg2", "postgresql+psycopg2")
+        return self.DATABASE_URL.replace("+asyncpg", "+psycopg2").replace(
+            "postgresql+psycopg2", "postgresql+psycopg2"
+        )
 
     model_config = {"env_file": str(_ENV_FILE), "extra": "ignore"}
 

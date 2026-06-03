@@ -45,8 +45,9 @@ def main():
             print("Fetching transcript...")
             f.write("📜 RAW TRANSCRIPT SEGMENTS:\n")
             f.write("-" * 40 + "\n")
-            segments = get_transcript(video_id)
-            print(f"Got {len(segments)} segments")
+            result = get_transcript(video_id)
+            segments = result.segments
+            print(f"Got {len(segments)} segments (is_generated={result.is_generated})")
             f.write(f"Total: {len(segments)} segments\n\n")
             for i, seg in enumerate(segments):
                 f.write(f"[{seg.start:6.2f}s - {seg.end:6.2f}s] {seg.text}\n")

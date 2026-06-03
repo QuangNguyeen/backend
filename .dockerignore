@@ -1,4 +1,21 @@
 
+# Secrets & runtime data (mount at runtime, never bake into image)
+db_data/
+secrets/
+cookies.txt
+scripts/gen-lang-client-*.json
+*.mp3
+
+# CI / legacy infra
+jenkins_home/
+node_modules/
+
+# Tests & demo scripts
+tests/
+demo.py
+fetch_subtitles.py
+scripts/demo_*.py
+
 subtitles_output.txt
 # Subtitles output
 

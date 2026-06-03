@@ -16,11 +16,10 @@ import assemblyai as aai
 from app.config import get_settings
 from app.services.google_stt_service import (
     MAX_STT_DURATION,
-    _extract_audio,
-    _merge_short_segments,
     _enforce_non_overlapping,
+    _extract_audio,
 )
-from app.services.youtube_service import TranscriptSegment
+from app.services.youtube_service import TranscriptSegment, process_transcript_segments
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +49,9 @@ def transcribe_with_assemblyai(
 
     aai.settings.api_key = settings.ASSEMBLYAI_API_KEY
     pipeline_t0 = time.time()
-    logger.info("[AssemblyAI] === Starting pipeline for %s (duration=%ds) ===", video_id, video_duration)
+    logger.info(
+        "[AssemblyAI] === Starting pipeline for %s (duration=%ds) ===", video_id, video_duration
+    )
 
     # Step 1: Extract audio
     with tempfile.TemporaryDirectory() as tmp:
@@ -99,20 +100,25 @@ def transcribe_with_assemblyai(
         end_sec = sent.end / 1000.0
         duration_sec = end_sec - start_sec
 
-        segments.append(TranscriptSegment(
-            text=sent.text,
-            start=start_sec,
-            duration=duration_sec,
-        ))
+        segments.append(
+            TranscriptSegment(
+                text=sent.text,
+                start=start_sec,
+                duration=duration_sec,
+            )
+        )
 
         logger.info(
             "[AssemblyAI] Sentence %2d | %6.2f → %6.2f (%5.2fs) | %s",
-            i + 1, start_sec, end_sec, duration_sec,
+            i + 1,
+            start_sec,
+            end_sec,
+            duration_sec,
             sent.text[:80] + ("…" if len(sent.text) > 80 else ""),
         )
 
-    # Step 5: Merge short fragments (< 5 words)
-    segments = _merge_short_segments(segments)
+    # Step 5: Split overlong sentences and merge short fragments safely.
+    segments = process_transcript_segments(segments, mode="dictation")
 
     # Step 6: Guarantee no overlapping audio ranges
     segments = _enforce_non_overlapping(segments)
@@ -120,6 +126,8 @@ def transcribe_with_assemblyai(
     total_elapsed = time.time() - pipeline_t0
     logger.info(
         "[AssemblyAI] === Pipeline complete for %s: %d segments in %.1fs ===",
-        video_id, len(segments), total_elapsed,
+        video_id,
+        len(segments),
+        total_elapsed,
     )
     return segments

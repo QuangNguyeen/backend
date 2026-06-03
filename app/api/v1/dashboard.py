@@ -2,19 +2,19 @@ import logging
 from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends
+from sqlalchemy import Date, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, cast, Date
 
-from app.database import get_db
 from app.api.deps import get_current_user
-from app.models.user import User
+from app.database import get_db
 from app.models.dictation import DictationAttempt, DictationSentence
+from app.models.user import User
 from app.models.video import Video
 from app.schemas.dictation import (
+    AccuracyPoint,
     DashboardFullResponse,
     DashboardStatsResponse,
     HeatmapDay,
-    AccuracyPoint,
     HistoryEntryResponse,
 )
 from app.services.stats_service import compute_streaks
@@ -109,11 +109,13 @@ async def get_dashboard(
     d = year_start
     while d <= today:
         count = day_counts.get(d, 0)
-        heatmap.append(HeatmapDay(
-            date=d.isoformat(),
-            count=count,
-            level=_count_to_level(count),
-        ))
+        heatmap.append(
+            HeatmapDay(
+                date=d.isoformat(),
+                count=count,
+                level=_count_to_level(count),
+            )
+        )
         d += timedelta(days=1)
 
     # ── Streaks ──────────────────────────────────────────────────────────────
@@ -143,11 +145,13 @@ async def get_dashboard(
         ts = row.completed_at or row.updated_at
         label = ts.strftime("%b %d") if ts else f"Session {i + 1}"
         score_pct = round((row.score or 0) * 100, 1)
-        accuracy_trend.append(AccuracyPoint(
-            date=label,
-            score=score_pct,
-            accuracy=score_pct,
-        ))
+        accuracy_trend.append(
+            AccuracyPoint(
+                date=label,
+                score=score_pct,
+                accuracy=score_pct,
+            )
+        )
 
     return DashboardFullResponse(
         stats=DashboardStatsResponse(
@@ -218,16 +222,18 @@ async def get_history(
     for attempt, video_title, thumbnail in result.all():
         total = attempt.total_sentences or 0
         current = attempt.current_sentence_index or 0
-        entries.append(HistoryEntryResponse(
-            id=attempt.id,
-            video_title=video_title,
-            video_thumbnail=thumbnail or "",
-            type="dictation",
-            status=attempt.status,
-            score=round((attempt.score or 0) * 100, 1) if attempt.score is not None else None,
-            progress_str=f"{current}/{total}",
-            completed_at=attempt.completed_at.isoformat() if attempt.completed_at else None,
-            updated_at=attempt.updated_at.isoformat(),
-        ))
+        entries.append(
+            HistoryEntryResponse(
+                id=attempt.id,
+                video_title=video_title,
+                video_thumbnail=thumbnail or "",
+                type="dictation",
+                status=attempt.status,
+                score=round((attempt.score or 0) * 100, 1) if attempt.score is not None else None,
+                progress_str=f"{current}/{total}",
+                completed_at=attempt.completed_at.isoformat() if attempt.completed_at else None,
+                updated_at=attempt.updated_at.isoformat(),
+            )
+        )
 
     return entries

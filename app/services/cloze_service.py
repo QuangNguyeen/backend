@@ -14,7 +14,7 @@ have to persist the cloze layout.
 from __future__ import annotations
 
 import re
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 from app.models.video import Transcript
 from app.schemas.cloze import ClozeChunk, ClozeSegment, ClozeToken
@@ -55,11 +55,13 @@ def _tokenize_spacy(text: str) -> tuple[list[dict], list[int]]:
             and not tok.is_stop
             and (tok.pos_ in PREFERRED_POS or len(tok.text) >= FALLBACK_MIN_LEN)
         )
-        tokens.append({
-            "text": tok.text,
-            "with_ws": tok.text_with_ws,
-            "is_punct": tok.is_punct,
-        })
+        tokens.append(
+            {
+                "text": tok.text,
+                "with_ws": tok.text_with_ws,
+                "is_punct": tok.is_punct,
+            }
+        )
         if is_candidate:
             candidates.append(len(tokens) - 1)
     return tokens, candidates
@@ -79,11 +81,13 @@ def _tokenize_regex(text: str) -> tuple[list[dict], list[int]]:
                 tokens[-1]["with_ws"] = tokens[-1]["with_ws"] + raw
             continue
         is_word = raw.isalpha()
-        tokens.append({
-            "text": raw,
-            "with_ws": raw,
-            "is_punct": not is_word,
-        })
+        tokens.append(
+            {
+                "text": raw,
+                "with_ws": raw,
+                "is_punct": not is_word,
+            }
+        )
         if is_word and len(raw) >= FALLBACK_MIN_LEN:
             candidates.append(len(tokens) - 1)
         if i + 1 < len(raw_tokens) and raw_tokens[i + 1].isspace():
@@ -98,6 +102,7 @@ def _tokenize(text: str) -> tuple[list[dict], list[int]]:
 
 
 # ─── Full-transcript cloze (new) ────────────────────────────────────────────
+
 
 def build_full_cloze(
     transcripts: Iterable[Transcript],
@@ -121,11 +126,13 @@ def build_full_cloze(
         tokens, candidates = _tokenize(text)
         for tok_idx in candidates:
             global_candidates.append((seg_i, tok_idx))
-        all_seg_data.append({
-            "transcript": transcript,
-            "tokens": tokens,
-            "candidates": candidates,
-        })
+        all_seg_data.append(
+            {
+                "transcript": transcript,
+                "tokens": tokens,
+                "candidates": candidates,
+            }
+        )
 
     total_blanks_target = max(1, int(len(global_candidates) * ratio))
     selected_indices = _pick_evenly(list(range(len(global_candidates))), total_blanks_target)
@@ -141,26 +148,32 @@ def build_full_cloze(
 
         for tok_i, tok in enumerate(seg_data["tokens"]):
             if (seg_i, tok_i) in selected_set:
-                seg_tokens.append(ClozeToken(
-                    text=tok["text"],
-                    is_blank=True,
-                    blank_index=blank_counter,
-                ))
+                seg_tokens.append(
+                    ClozeToken(
+                        text=tok["text"],
+                        is_blank=True,
+                        blank_index=blank_counter,
+                    )
+                )
                 blank_counter += 1
                 seg_blank_count += 1
             else:
-                seg_tokens.append(ClozeToken(
-                    text=tok["with_ws"],
-                    is_blank=False,
-                ))
+                seg_tokens.append(
+                    ClozeToken(
+                        text=tok["with_ws"],
+                        is_blank=False,
+                    )
+                )
 
-        segments.append(ClozeSegment(
-            segment_index=t.index,
-            start_time=t.start_time,
-            end_time=t.end_time,
-            tokens=seg_tokens,
-            blank_count=seg_blank_count,
-        ))
+        segments.append(
+            ClozeSegment(
+                segment_index=t.index,
+                start_time=t.start_time,
+                end_time=t.end_time,
+                tokens=seg_tokens,
+                blank_count=seg_blank_count,
+            )
+        )
 
     return segments, blank_counter
 
@@ -195,23 +208,25 @@ def _build_chunk(
 
     blank_indices = _pick_evenly(candidates, blanks_per_chunk)
     blank_set = set(blank_indices)
-    blank_index_for_token: dict[int, int] = {
-        tok_idx: i for i, tok_idx in enumerate(blank_indices)
-    }
+    blank_index_for_token: dict[int, int] = {tok_idx: i for i, tok_idx in enumerate(blank_indices)}
 
     cloze_tokens: list[ClozeToken] = []
     for i, tok in enumerate(tokens):
         if i in blank_set:
-            cloze_tokens.append(ClozeToken(
-                text=tok["text"],
-                is_blank=True,
-                blank_index=blank_index_for_token[i],
-            ))
+            cloze_tokens.append(
+                ClozeToken(
+                    text=tok["text"],
+                    is_blank=True,
+                    blank_index=blank_index_for_token[i],
+                )
+            )
         else:
-            cloze_tokens.append(ClozeToken(
-                text=tok["with_ws"],
-                is_blank=False,
-            ))
+            cloze_tokens.append(
+                ClozeToken(
+                    text=tok["with_ws"],
+                    is_blank=False,
+                )
+            )
 
     return ClozeChunk(
         chunk_index=chunk_index,
@@ -230,7 +245,7 @@ def build_chunks(
     sorted_segs = sorted(transcripts, key=lambda t: t.index)
     chunks: list[ClozeChunk] = []
     for i in range(0, len(sorted_segs), chunk_size):
-        group = sorted_segs[i:i + chunk_size]
+        group = sorted_segs[i : i + chunk_size]
         if not group:
             continue
         chunks.append(_build_chunk(i // chunk_size, group, blanks_per_chunk))

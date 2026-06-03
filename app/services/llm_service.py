@@ -37,6 +37,7 @@ def _get_translate_client():
         if creds_path:
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
         from google.cloud import translate as gc_translate
+
         _translate_client = gc_translate.TranslationServiceClient()
     return _translate_client
 
@@ -81,6 +82,8 @@ async def google_translate(
     except Exception as e:
         logger.warning("Google Cloud Translation failed for %r: %s", text[:80], e)
         return None
+
+
 _MODEL_NAME = "gemini-2.5-flash"
 
 
@@ -119,7 +122,7 @@ async def punctuate_transcript(raw_text: str, language: str = "en") -> str | Non
     CHUNK_SIZE = 3000
     chunks: list[str] = []
     for i in range(0, len(words), CHUNK_SIZE):
-        chunks.append(" ".join(words[i:i + CHUNK_SIZE]))
+        chunks.append(" ".join(words[i : i + CHUNK_SIZE]))
 
     punctuated_parts: list[str] = []
 
@@ -161,14 +164,20 @@ async def punctuate_transcript(raw_text: str, language: str = "en") -> str | Non
                             "Gemini punctuation word-count drift too high "
                             "(chunk %d: input=%d, output=%d, drift=%.1f%%). "
                             "Discarding result.",
-                            chunk_idx, input_wc, output_wc, drift * 100,
+                            chunk_idx,
+                            input_wc,
+                            output_wc,
+                            drift * 100,
                         )
                         return None
                     if drift > 0.10:
                         logger.warning(
                             "Gemini punctuation word-count drift elevated but acceptable "
                             "(chunk %d: input=%d, output=%d, drift=%.1f%%).",
-                            chunk_idx, input_wc, output_wc, drift * 100,
+                            chunk_idx,
+                            input_wc,
+                            output_wc,
+                            drift * 100,
                         )
                     punctuated_parts.append(result)
                     success = True
@@ -176,7 +185,9 @@ async def punctuate_transcript(raw_text: str, language: str = "en") -> str | Non
             except Exception as e:
                 logger.warning(
                     "Gemini punctuation failed (chunk %d, attempt %d): %s",
-                    chunk_idx, attempt + 1, e,
+                    chunk_idx,
+                    attempt + 1,
+                    e,
                 )
                 last_exc = e
                 if attempt < attempts - 1:
@@ -184,14 +195,17 @@ async def punctuate_transcript(raw_text: str, language: str = "en") -> str | Non
 
         if not success:
             logger.warning(
-                "Gemini punctuation gave up on chunk %d: %s", chunk_idx, last_exc,
+                "Gemini punctuation gave up on chunk %d: %s",
+                chunk_idx,
+                last_exc,
             )
             return None
 
     full_result = " ".join(punctuated_parts)
     logger.warning(
         "Gemini punctuation completed: %d words in, %d words out",
-        len(words), len(full_result.split()),
+        len(words),
+        len(full_result.split()),
     )
     return full_result
 
@@ -214,7 +228,7 @@ def _audio_url_matches_word(audio_url: str, word: str) -> bool:
     w = word.lower()
     if not filename.startswith(w):
         return False
-    trailing = filename[len(w):]
+    trailing = filename[len(w) :]
     return trailing == "" or trailing[0] in {".", "-", "_"}
 
 
@@ -224,6 +238,7 @@ _TTS_FALLBACK_PREFIX = "/api/v1/vocabulary/tts/"
 @dataclass
 class DictionaryResult:
     """Everything we can extract from a single dictionaryapi.dev call."""
+
     audio_url: str | None = None
     phonetic: str | None = None
     meaning_en: str | None = None
@@ -251,10 +266,13 @@ async def _fetch_gemini_dictionary(word: str) -> GeminiDictionaryResponse | None
     prompt = (
         f"You are a professional English-Vietnamese dictionary. "
         f"Look up the English word '{word}'. "
-        f"For 'phonetic', provide the most common IPA pronunciation (e.g. /wɪnd/ for wind meaning breeze). "
-        f"For 'meaning_vi', provide concise, accurate Vietnamese dictionary equivalents (1-4 words max). "
+        "For 'phonetic', provide the most common IPA pronunciation "
+        "(e.g. /wɪnd/ for wind meaning breeze). "
+        "For 'meaning_vi', provide concise, accurate Vietnamese dictionary "
+        "equivalents (1-4 words max). "
         f"For 'meaning_en', provide a short English definition (under 10 words). "
-        f"Do NOT provide long explanatory sentences. Return only the most common parts of speech (max 3)."
+        "Do NOT provide long explanatory sentences. Return only the most "
+        "common parts of speech (max 3)."
     )
 
     try:
@@ -276,6 +294,65 @@ async def _fetch_gemini_dictionary(word: str) -> GeminiDictionaryResponse | None
     return None
 
 
+class _ExampleItem(pydantic.BaseModel):
+    word: str
+    example: str
+
+
+class _ExampleBatchResponse(pydantic.BaseModel):
+    items: list[_ExampleItem]
+
+
+async def generate_example_sentences(words: list[str]) -> dict[str, str]:
+    """Generate one natural B1-level example sentence per word via Gemini.
+
+    Returns a mapping of ``word -> example sentence``. Words for which Gemini
+    fails to produce a sentence are simply omitted from the result. Safe to call
+    with an empty list (returns ``{}``).
+    """
+    if not words:
+        return {}
+
+    client = _get_client()
+    if client is None:
+        logger.warning("GEMINI_API_KEY not configured; skipping example generation")
+        return {}
+
+    word_list = "\n".join(words)
+    prompt = (
+        "You are an English teacher. For each English word below, write ONE "
+        "natural, B1-level example sentence that uses the word in context. "
+        "Keep each sentence under 18 words. Return the word exactly as given.\n\n"
+        f"Words:\n{word_list}"
+    )
+
+    try:
+        response = await client.aio.models.generate_content(
+            model=_MODEL_NAME,
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=_ExampleBatchResponse,
+                temperature=0.4,
+            ),
+        )
+        if not response.text:
+            return {}
+        data = _ExampleBatchResponse(**json.loads(response.text))
+    except Exception as e:
+        logger.warning("Gemini example generation failed for %d words: %s", len(words), e)
+        return {}
+
+    wanted = {w.lower(): w for w in words}
+    out: dict[str, str] = {}
+    for item in data.items:
+        key = item.word.strip().lower()
+        original = wanted.get(key)
+        if original and item.example and item.example.strip():
+            out[original] = item.example.strip()
+    return out
+
+
 async def _fetch_dictionary_audio_ipa(word: str) -> DictionaryResult:
     """Fetch audio URL and IPA from dictionaryapi.dev (meanings are handled by Gemini)."""
     url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
@@ -288,6 +365,7 @@ async def _fetch_dictionary_audio_ipa(word: str) -> DictionaryResult:
     except Exception as e:
         logger.info("dictionaryapi.dev miss for word=%r: %s", word, e)
         from urllib.parse import quote
+
         result.audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(word)}"
         return result
 
@@ -319,6 +397,7 @@ async def _fetch_dictionary_audio_ipa(word: str) -> DictionaryResult:
 
     if not result.audio_url:
         from urllib.parse import quote
+
         result.audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(word)}"
 
     return result
@@ -336,6 +415,7 @@ async def fetch_dictionary_data(word: str, translate_meaning: bool = True) -> Di
     Fallback: dictionaryapi.dev + Gemini if Cambridge fails.
     """
     import time as _time
+
     cache_key = f"{word}:{translate_meaning}"
     cached = _dict_cache.get(cache_key)
     if cached and (_time.monotonic() - cached[0]) < _DICT_CACHE_TTL:
@@ -369,11 +449,19 @@ async def fetch_dictionary_data(word: str, translate_meaning: bool = True) -> Di
             is_word_form = False
             if en_entry and en_entry.definitions:
                 first_def = en_entry.definitions[0].definition.lower()
-                if any(marker in first_def for marker in (
-                    "past simple of", "past participle of", "present participle of",
-                    "plural of", "comparative of", "superlative of",
-                    "third person singular of", "short form of",
-                )):
+                if any(
+                    marker in first_def
+                    for marker in (
+                        "past simple of",
+                        "past participle of",
+                        "present participle of",
+                        "plural of",
+                        "comparative of",
+                        "superlative of",
+                        "third person singular of",
+                        "short form of",
+                    )
+                ):
                     is_word_form = True
                     result.meaning_en = en_entry.definitions[0].definition
 
@@ -413,6 +501,7 @@ async def fetch_dictionary_data(word: str, translate_meaning: bool = True) -> Di
             if has_data and not needs_vi:
                 if not result.audio_url:
                     from urllib.parse import quote
+
                     result.audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(word)}"
                 _dict_cache[cache_key] = (_time.monotonic(), result)
                 if len(_dict_cache) > _DICT_CACHE_MAX:
@@ -438,6 +527,7 @@ async def fetch_dictionary_data(word: str, translate_meaning: bool = True) -> Di
                         result.part_of_speech = "; ".join(parts)
                 if not result.audio_url:
                     from urllib.parse import quote
+
                     result.audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(word)}"
                 _dict_cache[cache_key] = (_time.monotonic(), result)
                 if len(_dict_cache) > _DICT_CACHE_MAX:

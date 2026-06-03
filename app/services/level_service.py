@@ -39,7 +39,9 @@ Reference Zipf values (English)
 from __future__ import annotations
 
 import logging
+import re
 from statistics import mean
+from typing import Any
 
 import spacy
 from wordfreq import zipf_frequency
@@ -49,6 +51,7 @@ logger = logging.getLogger(__name__)
 # ─── spaCy model (loaded once at module import) ───────────────────────────────
 
 _nlp: spacy.Language | None = None
+
 
 def _get_nlp() -> spacy.Language:
     global _nlp
@@ -77,8 +80,18 @@ CEFR_THRESHOLDS = [
     (80, "C1"),
 ]
 
+CEFR_LABELS = {
+    "A1": "Beginner",
+    "A2": "Elementary",
+    "B1": "Intermediate",
+    "B2": "Upper Intermediate",
+    "C1": "Advanced",
+    "C2": "Proficient",
+}
+
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
+
 
 def _dep_depth(token: spacy.tokens.Token) -> int:
     """Recursively compute the depth of a token in the dependency tree."""
@@ -96,6 +109,7 @@ def _max_sent_depth(sent: spacy.tokens.Span) -> int:
 
 
 # ─── Feature extraction ───────────────────────────────────────────────────────
+
 
 def extract_features(text: str, language: str = "en") -> dict:
     """Extract all NLP and frequency features from text.
@@ -115,10 +129,7 @@ def extract_features(text: str, language: str = "en") -> dict:
     n_sentences = len(sentences)
 
     # ── Sentence length ───────────────────────────────────────────────────────
-    sent_lengths = [
-        sum(1 for t in sent if not t.is_space and not t.is_punct)
-        for sent in sentences
-    ]
+    sent_lengths = [sum(1 for t in sent if not t.is_space and not t.is_punct) for sent in sentences]
     avg_sent_length = mean(sent_lengths) if sent_lengths else 0.0
 
     # ── Syntactic depth ────────────────────────────────────────────────────────
@@ -127,11 +138,9 @@ def extract_features(text: str, language: str = "en") -> dict:
 
     # ── Vocabulary frequency ───────────────────────────────────────────────────
     content_tokens = [
-        t for t in doc
-        if t.pos_ in CONTENT_POS
-        and not t.is_stop
-        and t.lemma_.isalpha()
-        and len(t.lemma_) > 1
+        t
+        for t in doc
+        if t.pos_ in CONTENT_POS and not t.is_stop and t.lemma_.isalpha() and len(t.lemma_) > 1
     ]
 
     zipf_scores: list[float] = []
@@ -141,10 +150,7 @@ def extract_features(text: str, language: str = "en") -> dict:
         zipf_scores.append(freq)
 
     avg_zipf = mean(zipf_scores) if zipf_scores else 4.5
-    rare_ratio = (
-        sum(1 for f in zipf_scores if f < 3.5) / len(zipf_scores)
-        if zipf_scores else 0.0
-    )
+    rare_ratio = sum(1 for f in zipf_scores if f < 3.5) / len(zipf_scores) if zipf_scores else 0.0
 
     return {
         "avg_zipf": round(avg_zipf, 3),
@@ -157,6 +163,7 @@ def extract_features(text: str, language: str = "en") -> dict:
 
 
 # ─── Composite scoring ────────────────────────────────────────────────────────
+
 
 def compute_difficulty_score(features: dict) -> float:
     """Map extracted features to a 0–100 difficulty score.
@@ -183,15 +190,12 @@ def compute_difficulty_score(features: dict) -> float:
     depth_score = max(0.0, min(100.0, (features["avg_dep_depth"] - 2.0) * 15.0))
 
     # ── Weighted composite ────────────────────────────────────────────────────
-    composite = (
-        0.50 * vocab_score
-        + 0.30 * length_score
-        + 0.20 * depth_score
-    )
+    composite = 0.50 * vocab_score + 0.30 * length_score + 0.20 * depth_score
     return round(composite, 2)
 
 
 # ─── CEFR mapping ─────────────────────────────────────────────────────────────
+
 
 def score_to_cefr(score: float) -> str:
     """Map 0–100 difficulty score to CEFR band."""
@@ -201,7 +205,230 @@ def score_to_cefr(score: float) -> str:
     return "C2"
 
 
+def score_to_cefr_level(score: float) -> str:
+    """Map audio difficulty score to CEFR using inclusive requested bands."""
+    if score <= 20:
+        return "A1"
+    if score <= 35:
+        return "A2"
+    if score <= 50:
+        return "B1"
+    if score <= 68:
+        return "B2"
+    if score <= 84:
+        return "C1"
+    return "C2"
+
+
+def _clamp(value: float, lower: float = 0.0, upper: float = 100.0) -> float:
+    return max(lower, min(upper, value))
+
+
+def _segment_text(segment: Any) -> str:
+    return str(getattr(segment, "text", "") or "")
+
+
+def _segment_start(segment: Any) -> float:
+    return float(getattr(segment, "start", getattr(segment, "start_time", 0.0)) or 0.0)
+
+
+def _segment_end(segment: Any) -> float:
+    if hasattr(segment, "end"):
+        return float(getattr(segment, "end") or 0.0)
+    return float(getattr(segment, "end_time", _segment_start(segment)) or _segment_start(segment))
+
+
+WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?")
+UNCLEAR_RE = re.compile(r"\[(?:inaudible|unclear|music|applause)\]|\?{2,}|_{2,}", re.I)
+COMPLEX_MARKERS = {
+    "because",
+    "although",
+    "while",
+    "whereas",
+    "since",
+    "unless",
+    "however",
+    "therefore",
+    "which",
+    "who",
+    "that",
+}
+
+
+def _word_count(text: str) -> int:
+    return len(WORD_RE.findall(text))
+
+
+def _scale(value: float, low: float, high: float) -> float:
+    if high <= low:
+        return 0.0
+    return _clamp(((value - low) / (high - low)) * 100.0)
+
+
+def _fallback_lexical_metrics(text: str, language: str) -> tuple[float, float, float]:
+    words = [w.lower() for w in WORD_RE.findall(text)]
+    if not words:
+        return 30.0, 0.0, 0.0
+
+    scores = [zipf_frequency(word, language, wordlist="best", minimum=0.0) for word in words]
+    unknown_ratio = sum(1 for score in scores if score <= 0.5) / len(scores)
+    rare_ratio = sum(1 for score in scores if score < 3.5) / len(scores)
+    long_word_ratio = sum(1 for word in words if len(word) >= 9) / len(words)
+    lexical = _clamp((rare_ratio * 65.0) + (unknown_ratio * 25.0) + (long_word_ratio * 25.0))
+    return lexical, unknown_ratio, rare_ratio
+
+
+def _sentence_complexity_score(text: str, avg_words: float, max_words: int) -> float:
+    lowered = text.lower()
+    marker_count = sum(
+        len(re.findall(rf"\b{re.escape(marker)}\b", lowered)) for marker in COMPLEX_MARKERS
+    )
+    punctuation_count = len(re.findall(r"[,;:]", text))
+    long_segment_score = _scale(max_words, 14, 34)
+    avg_length_score = _scale(avg_words, 8, 24)
+    marker_score = _scale(marker_count, 2, 12)
+    punctuation_score = _scale(punctuation_count, 3, 20)
+    return round(
+        _clamp(
+            0.35 * avg_length_score
+            + 0.25 * long_segment_score
+            + 0.25 * marker_score
+            + 0.15 * punctuation_score
+        ),
+        2,
+    )
+
+
+def _recommended_modes(level: str) -> dict[str, bool]:
+    if level in {"A1", "A2"}:
+        return {"dictation": True, "cloze": True, "wordOrdering": True, "shadowing": False}
+    if level in {"B1", "B2"}:
+        return {"dictation": True, "cloze": True, "wordOrdering": level == "B1", "shadowing": False}
+    return {"dictation": True, "cloze": True, "wordOrdering": False, "shadowing": True}
+
+
+def calculate_audio_difficulty(
+    video: Any,
+    transcript_segments: list[Any],
+    options: dict | None = None,
+) -> dict:
+    """Score transcript/audio difficulty for practice and persistable metadata."""
+    options = options or {}
+    language = options.get("language") or getattr(video, "language", "en") or "en"
+    duration_seconds = float(options.get("duration_seconds") or getattr(video, "duration", 0) or 0)
+
+    texts = [
+        _segment_text(segment).strip()
+        for segment in transcript_segments
+        if _segment_text(segment).strip()
+    ]
+    full_text = " ".join(texts)
+    word_counts = [_word_count(text) for text in texts]
+    total_words = sum(word_counts)
+    segment_count = len(word_counts)
+    avg_words = mean(word_counts) if word_counts else 0.0
+    max_words = max(word_counts) if word_counts else 0
+
+    if duration_seconds <= 0 and transcript_segments:
+        starts = [_segment_start(segment) for segment in transcript_segments]
+        ends = [_segment_end(segment) for segment in transcript_segments]
+        duration_seconds = max(0.0, max(ends) - min(starts))
+    duration_minutes = max(duration_seconds / 60.0, 0.1)
+    words_per_minute = total_words / duration_minutes if total_words else 0.0
+
+    avg_words_score = _scale(avg_words, 6, 24)
+    max_words_score = _scale(max_words, 14, 34)
+    wpm_score = _scale(words_per_minute, 80, 190)
+
+    try:
+        nlp_features = (
+            extract_features(full_text, language=language)
+            if full_text and total_words >= 10
+            else {}
+        )
+        avg_zipf = nlp_features.get("avg_zipf", 4.5)
+        rare_ratio = nlp_features.get("rare_ratio", 0.0)
+        lexical_score = _clamp(((6.2 - avg_zipf) * 28.0) + (rare_ratio * 65.0))
+        unknown_ratio = _fallback_lexical_metrics(full_text, language)[1]
+        proper_noun_ratio = 0.0
+    except Exception:
+        lexical_score, unknown_ratio, _rare_ratio = _fallback_lexical_metrics(full_text, language)
+        proper_noun_ratio = 0.0
+
+    sentence_complexity = _sentence_complexity_score(full_text, avg_words, max_words)
+    unclear_hits = len(UNCLEAR_RE.findall(full_text))
+    zero_duration = sum(
+        1 for segment in transcript_segments if _segment_end(segment) <= _segment_start(segment)
+    )
+    audio_quality_penalty = _clamp((unclear_hits * 10.0) + (zero_duration * 8.0))
+    transcript_confidence = _clamp(100.0 - audio_quality_penalty)
+
+    score = round(
+        _clamp(
+            0.20 * avg_words_score
+            + 0.10 * max_words_score
+            + 0.20 * wpm_score
+            + 0.25 * lexical_score
+            + 0.15 * sentence_complexity
+            + 0.10 * audio_quality_penalty
+        ),
+        2,
+    )
+    level = score_to_cefr_level(score)
+
+    factors = {
+        "avgWordsPerSegment": round(avg_words, 2),
+        "maxWordsPerSegment": max_words,
+        "wordsPerMinute": round(words_per_minute, 2),
+        "lexicalDifficulty": round(lexical_score, 2),
+        "sentenceComplexity": sentence_complexity,
+        "transcriptConfidence": round(transcript_confidence, 2),
+        "audioQualityPenalty": round(audio_quality_penalty, 2),
+        "unknownWordRatio": round(unknown_ratio, 4),
+        "properNounRatio": round(proper_noun_ratio, 4),
+    }
+    explanation = [
+        f"Average segment length is {avg_words:.1f} words.",
+        f"Speech rate is {words_per_minute:.0f} WPM.",
+        f"Vocabulary difficulty score is {lexical_score:.0f}/100.",
+    ]
+    if max_words > 30:
+        explanation.append(
+            f"Longest segment has {max_words} words, which is difficult for dictation."
+        )
+    if audio_quality_penalty > 0:
+        explanation.append("Transcript/audio quality signals add a difficulty penalty.")
+
+    return {
+        "score": score,
+        "level": level,
+        "label": CEFR_LABELS[level],
+        "factors": factors,
+        "explanation": explanation,
+        "recommendedModes": _recommended_modes(level),
+        "segmentCount": segment_count,
+        "totalWordCount": total_words,
+    }
+
+
+def difficulty_update_values(analysis: dict) -> dict:
+    """Map an audio difficulty result to Video column names."""
+    factors = analysis.get("factors") or {}
+    return {
+        "difficulty_score": analysis.get("score"),
+        "difficulty_level": analysis.get("level"),
+        "difficulty_label": analysis.get("label"),
+        "difficulty_factors": factors,
+        "avg_words_per_segment": factors.get("avgWordsPerSegment"),
+        "max_words_per_segment": factors.get("maxWordsPerSegment"),
+        "words_per_minute": factors.get("wordsPerMinute"),
+        "segment_count": analysis.get("segmentCount"),
+        "total_word_count": analysis.get("totalWordCount"),
+    }
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
+
 
 def analyze_level(text: str, language: str = "en") -> str:
     """Analyze text and return its estimated CEFR level (A1–C2).
@@ -225,7 +452,8 @@ def analyze_level(text: str, language: str = "en") -> str:
         logger.info(
             "Level analysis: level=%s score=%.1f zipf=%.2f rare=%.0f%% "
             "sent_len=%.1f dep_depth=%.1f n_words=%d",
-            level, score,
+            level,
+            score,
             features["avg_zipf"],
             features["rare_ratio"] * 100,
             features["avg_sent_length"],
@@ -293,7 +521,10 @@ def estimate_cefr_with_speech_rate(
         level = _FK_CEFR_MAP[final_idx]
         logger.info(
             "CEFR estimation: FK_grade=%.1f base=%s wpm=%.0f final=%s",
-            grade, _FK_CEFR_MAP[base_idx], wpm, level,
+            grade,
+            _FK_CEFR_MAP[base_idx],
+            wpm,
+            level,
         )
         return level
 

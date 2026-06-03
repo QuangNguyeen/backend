@@ -26,13 +26,15 @@ _USER_AGENT = (
 # lxml is ~1.4x faster; installed as optional dependency
 try:
     import lxml  # noqa: F401
+
     _PARSER = "lxml"
 except ImportError:
     _PARSER = "html.parser"
 
 # Regex to extract just the dictionary body (~22KB vs ~260KB full page)
 _DICT_BODY_RE = re.compile(
-    r'(<div class="pr dictionary".*?</div>\s*<!--)', re.DOTALL,
+    r'(<div class="pr dictionary".*?</div>\s*<!--)',
+    re.DOTALL,
 )
 
 # ── In-memory LRU cache (O(1) eviction via OrderedDict) ────────────────────
@@ -62,6 +64,7 @@ def _trim_html(html: str) -> str:
     """Extract only the dictionary entry section to reduce parse cost."""
     m = _DICT_BODY_RE.search(html)
     return m.group(0) if m else html
+
 
 SUPPORTED_DICTS = {
     "en": "english",
@@ -120,8 +123,7 @@ class DictionaryEntry:
                     "definition": d.definition,
                     "translation": d.translation,
                     "examples": [
-                        {"text": e.text, "translation": e.translation}
-                        for e in d.examples
+                        {"text": e.text, "translation": e.translation} for e in d.examples
                     ],
                     "level": d.level,
                     "grammar": d.grammar,
@@ -239,9 +241,8 @@ def _parse_def_block(def_block: Tag, pos: str, grammar: str) -> Definition:
     definition_text = _text(def_el).rstrip(": ")
 
     # Translation
-    trans_el = (
-        def_block.select_one(".trans.dtrans.dtrans-se")
-        or def_block.select_one(".def-body .trans.dtrans")
+    trans_el = def_block.select_one(".trans.dtrans.dtrans-se") or def_block.select_one(
+        ".def-body .trans.dtrans"
     )
     translation = _text(trans_el)
 
@@ -319,7 +320,10 @@ async def _lookup_uncached(word: str, dictionary: str) -> DictionaryEntry | None
 
     logger.info(
         "[DICT] '%s' (%s): %d pron, %d defs",
-        headword, dictionary, len(entry.pronunciations), len(entry.definitions),
+        headword,
+        dictionary,
+        len(entry.pronunciations),
+        len(entry.definitions),
     )
     return entry
 

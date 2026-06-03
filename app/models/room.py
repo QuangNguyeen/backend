@@ -1,7 +1,18 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, Integer, Float, Boolean, Text, DateTime, ForeignKey, UniqueConstraint, Index, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -28,7 +39,9 @@ class RoomMember(Base):
     __tablename__ = "room_members"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    room_id: Mapped[str] = mapped_column(String(36), ForeignKey("room_sessions.id", ondelete="CASCADE"), nullable=False)
+    room_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("room_sessions.id", ondelete="CASCADE"), nullable=False
+    )
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     display_name: Mapped[str] = mapped_column(String(100), nullable=False)
     total_score: Mapped[float] = mapped_column(Float, default=0.0)
@@ -49,7 +62,9 @@ class RoomAnswer(Base):
     __tablename__ = "room_answers"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    room_id: Mapped[str] = mapped_column(String(36), ForeignKey("room_sessions.id", ondelete="CASCADE"), nullable=False)
+    room_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("room_sessions.id", ondelete="CASCADE"), nullable=False
+    )
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     sentence_index: Mapped[int] = mapped_column(Integer, nullable=False)
     user_input: Mapped[str] = mapped_column(Text, default="")
@@ -58,7 +73,9 @@ class RoomAnswer(Base):
     time_bonus: Mapped[float] = mapped_column(Float, default=0.0)
     final_score: Mapped[float] = mapped_column(Float, default=0.0)
     replay_count: Mapped[int] = mapped_column(Integer, default=0)
-    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
     __table_args__ = (
         UniqueConstraint("room_id", "user_id", "sentence_index", name="uq_room_answer"),

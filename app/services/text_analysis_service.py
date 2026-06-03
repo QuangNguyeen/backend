@@ -19,10 +19,10 @@ CEFR_LEVELS = ["A1", "A2", "B1", "B2", "C1", "C2"]
 # Zipf frequency thresholds: higher zipf = more common word
 # A1 learners know very common words (zipf >= 5.5), C2 knows rare ones (zipf < 2.5)
 FREQUENCY_BANDS = {
-    "high": 5.0,     # Very common: the, is, go, like
-    "medium": 4.0,   # Common: explain, dangerous, system
-    "low": 3.0,      # Uncommon: reluctant, coherent, arbitrary
-    "rare": 0.0,     # Rare: juxtaposition, ephemeral, perfunctory
+    "high": 5.0,  # Very common: the, is, go, like
+    "medium": 4.0,  # Common: explain, dangerous, system
+    "low": 3.0,  # Uncommon: reluctant, coherent, arbitrary
+    "rare": 0.0,  # Rare: juxtaposition, ephemeral, perfunctory
 }
 
 
@@ -108,7 +108,7 @@ def _sentence_complexity_metrics(sentences: list, tokens: list) -> dict:
         lengths.append(len(sent_tokens))
 
     avg_len = sum(lengths) / len(lengths) if lengths else 0
-    long_sentences = sum(1 for l in lengths if l > 15)
+    long_sentences = sum(1 for length in lengths if length > 15)
 
     return {
         "avg_sentence_length": round(avg_len, 1),
@@ -229,8 +229,8 @@ def get_word_difficulty_map(text: str, language: str = "en") -> dict[str, float]
     """
     import re
 
-    EASY_ZIPF = 6.0   # very common words (the, is, go)
-    HARD_ZIPF = 3.0   # rare words (ephemeral, juxtaposition)
+    EASY_ZIPF = 6.0  # very common words (the, is, go)
+    HARD_ZIPF = 3.0  # rare words (ephemeral, juxtaposition)
 
     words = re.findall(r"[a-zA-Z']+", text.lower())
     result: dict[str, float] = {}

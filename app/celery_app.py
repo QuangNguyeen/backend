@@ -22,18 +22,16 @@ celery.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     result_expires=3600,
-    worker_pool="solo",
+    worker_pool="prefork",
 )
 
-celery.conf.include = ["app.tasks.transcription"]
+celery.conf.include = ["app.tasks.transcription", "app.tasks.vocabulary_enrichment"]
 
 
 @setup_logging.connect
 def configure_worker_logging(**kwargs):
     handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter("[%(asctime)s: %(levelname)s/%(name)s] %(message)s")
-    )
+    handler.setFormatter(logging.Formatter("[%(asctime)s: %(levelname)s/%(name)s] %(message)s"))
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)

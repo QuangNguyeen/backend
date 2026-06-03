@@ -2,7 +2,6 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-
 PracticeMode = Literal["sentence", "cloze", "reorder"]
 ClozeDifficulty = Literal["easy", "medium", "hard"]
 
@@ -14,6 +13,7 @@ class ClozeToken(BaseModel):
 
 
 # ─── Legacy chunk-based types (kept for backward compat) ────────────────────
+
 
 class ClozeChunk(BaseModel):
     chunk_index: int
@@ -51,6 +51,7 @@ class ClozeResultResponse(BaseModel):
 
 
 # ─── New full-transcript cloze types ────────────────────────────────────────
+
 
 class ClozeSegment(BaseModel):
     segment_index: int

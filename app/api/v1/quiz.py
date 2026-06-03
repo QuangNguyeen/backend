@@ -1,17 +1,17 @@
 import random
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import get_db
 from app.api.deps import get_current_user
+from app.core.exceptions import BadRequestError, NotFoundError
+from app.database import get_db
+from app.models.quiz import QuizSession
 from app.models.user import User
 from app.models.video import Transcript
-from app.models.quiz import QuizSession
-from app.core.exceptions import NotFoundError, BadRequestError
 
 router = APIRouter(prefix="/quiz", tags=["Quiz"])
 
@@ -50,13 +50,15 @@ def _generate_questions(transcripts: list[Transcript], num_questions: int) -> li
         random.shuffle(choices)
         correct_index = choices.index(correct_text)
 
-        questions.append({
-            "question": "What did you hear?",
-            "choices": choices,
-            "correct_index": correct_index,
-            "start_time": t.start_time,
-            "end_time": t.end_time,
-        })
+        questions.append(
+            {
+                "question": "What did you hear?",
+                "choices": choices,
+                "correct_index": correct_index,
+                "start_time": t.start_time,
+                "end_time": t.end_time,
+            }
+        )
 
     return questions
 
@@ -68,9 +70,7 @@ async def create_quiz_session(
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        select(Transcript)
-        .where(Transcript.video_id == body.video_id)
-        .order_by(Transcript.index)
+        select(Transcript).where(Transcript.video_id == body.video_id).order_by(Transcript.index)
     )
     transcripts = list(result.scalars().all())
     if not transcripts:
@@ -114,12 +114,14 @@ async def answer_question(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    session = (await db.execute(
-        select(QuizSession).where(
-            QuizSession.id == session_id,
-            QuizSession.user_id == current_user.id,
+    session = (
+        await db.execute(
+            select(QuizSession).where(
+                QuizSession.id == session_id,
+                QuizSession.user_id == current_user.id,
+            )
         )
-    )).scalar_one_or_none()
+    ).scalar_one_or_none()
     if not session:
         raise NotFoundError("Quiz session not found")
     if session.status == "completed":
@@ -153,12 +155,14 @@ async def complete_quiz(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    session = (await db.execute(
-        select(QuizSession).where(
-            QuizSession.id == session_id,
-            QuizSession.user_id == current_user.id,
+    session = (
+        await db.execute(
+            select(QuizSession).where(
+                QuizSession.id == session_id,
+                QuizSession.user_id == current_user.id,
+            )
         )
-    )).scalar_one_or_none()
+    ).scalar_one_or_none()
     if not session:
         raise NotFoundError("Quiz session not found")
 
@@ -177,7 +181,7 @@ async def complete_quiz(
     session.status = "completed"
     session.correct_count = correct_count
     session.score = score
-    session.completed_at = datetime.now(timezone.utc)
+    session.completed_at = datetime.now(UTC)
     if session.created_at:
         session.duration_seconds = int((session.completed_at - session.created_at).total_seconds())
 
@@ -208,17 +212,24 @@ async def list_quiz_sessions(
         filters.append(QuizSession.status == status)
 
     from sqlalchemy import func as sa_func
-    total = (await db.execute(
-        select(sa_func.count()).select_from(QuizSession).where(*filters)
-    )).scalar() or 0
 
-    rows = (await db.execute(
-        select(QuizSession)
-        .where(*filters)
-        .order_by(QuizSession.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )).scalars().all()
+    total = (
+        await db.execute(select(sa_func.count()).select_from(QuizSession).where(*filters))
+    ).scalar() or 0
+
+    rows = (
+        (
+            await db.execute(
+                select(QuizSession)
+                .where(*filters)
+                .order_by(QuizSession.created_at.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     return {
         "items": [

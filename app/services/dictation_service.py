@@ -6,21 +6,25 @@ from app.schemas.dictation import WordDiffItem
 
 
 def _normalize(word: str) -> str:
-    """Normalize a word for comparison: lowercase, map quotes, strip accents, and remove punctuation."""
+    """Normalize a word for comparison before diffing."""
     # 1. Normalize quotes (curved -> straight)
-    clean_word = word.lower().replace("\u2019", "'").replace("\u2018", "'").replace("`", "'").replace("\u00b4", "'")
-    
+    clean_word = (
+        word.lower()
+        .replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("`", "'")
+        .replace("\u00b4", "'")
+    )
+
     # 2. Strip diacritics (e.g., café -> cafe)
-    nfd_form = unicodedata.normalize('NFD', clean_word)
-    ascii_word = ''.join(c for c in nfd_form if unicodedata.category(c) != 'Mn')
-    
+    nfd_form = unicodedata.normalize("NFD", clean_word)
+    ascii_word = "".join(c for c in nfd_form if unicodedata.category(c) != "Mn")
+
     # 3. Strip remaining punctuation (including apostrophes)
     return re.sub(r"[^\w\s]", "", ascii_word).strip()
 
 
-def compute_word_diff(
-    user_input: str, correct_text: str
-) -> tuple[list[WordDiffItem], float]:
+def compute_word_diff(user_input: str, correct_text: str) -> tuple[list[WordDiffItem], float]:
     """Compare user input with the correct transcript using LCS-style diffing.
 
     Uses difflib.SequenceMatcher over normalized word arrays so that a single

@@ -1,13 +1,19 @@
 """Tests for CEFR level analysis service."""
 
-import pytest
 from app.services.level_service import (
     analyze_level,
     analyze_level_detailed,
+    calculate_audio_difficulty,
     compute_difficulty_score,
     extract_features,
     score_to_cefr,
+    score_to_cefr_level,
 )
+from app.services.youtube_service import TranscriptSegment
+
+
+def _seg(text: str, start: float, duration: float) -> TranscriptSegment:
+    return TranscriptSegment(text=text, start=start, duration=duration)
 
 
 class TestScoreToCefr:
@@ -34,6 +40,16 @@ class TestScoreToCefr:
 
     def test_boundary_c1_c2(self):
         assert score_to_cefr(80) == "C2"
+
+
+class TestScoreToCefrLevel:
+    def test_audio_boundaries_are_inclusive(self):
+        assert score_to_cefr_level(20) == "A1"
+        assert score_to_cefr_level(35) == "A2"
+        assert score_to_cefr_level(50) == "B1"
+        assert score_to_cefr_level(68) == "B2"
+        assert score_to_cefr_level(84) == "C1"
+        assert score_to_cefr_level(85) == "C2"
 
 
 class TestExtractFeatures:
@@ -138,3 +154,72 @@ class TestAnalyzeLevelDetailed:
         result = analyze_level_detailed("Hi there.")
         assert result["level"] == "A2"
         assert result["score"] == 0.0
+
+
+class TestAudioDifficulty:
+    def test_short_slow_simple_transcript_is_low_level(self):
+        segments = [
+            _seg("I like cats.", 0.0, 3.0),
+            _seg("This is my house.", 3.2, 3.0),
+            _seg("The dog is happy.", 6.4, 3.0),
+        ]
+        result = calculate_audio_difficulty(
+            None, segments, {"duration_seconds": 90, "language": "en"}
+        )
+        assert result["level"] in {"A1", "A2"}
+
+    def test_medium_transcript_maps_to_intermediate_band(self):
+        segments = [
+            _seg("People often learn better when they practice every day.", 0.0, 4.5),
+            _seg("Regular listening helps them understand natural English more quickly.", 4.8, 4.5),
+            _seg("They can review mistakes and improve their pronunciation over time.", 9.6, 4.5),
+        ]
+        result = calculate_audio_difficulty(
+            None, segments, {"duration_seconds": 12, "language": "en"}
+        )
+        assert result["level"] in {"A2", "B1", "B2"}
+
+    def test_fast_rare_long_transcript_is_high_level(self):
+        segments = [
+            _seg(
+                "The epistemological ramifications of ubiquitous automation require "
+                "substantial interdisciplinary reconsideration because institutional "
+                "incentives remain misaligned.",
+                0.0,
+                4.0,
+            ),
+            _seg(
+                "Although policymakers acknowledge systemic vulnerabilities, "
+                "implementation frequently deteriorates into fragmented procedural "
+                "compliance.",
+                4.2,
+                4.0,
+            ),
+        ]
+        result = calculate_audio_difficulty(
+            None, segments, {"duration_seconds": 6, "language": "en"}
+        )
+        assert result["level"] in {"B2", "C1", "C2"}
+
+    def test_low_confidence_markers_add_penalty(self):
+        clean = [_seg("This is a normal sentence for practice.", 0.0, 5.0)]
+        noisy = [_seg("This is [inaudible] a normal ?? sentence for practice.", 0.0, 0.0)]
+        clean_result = calculate_audio_difficulty(
+            None, clean, {"duration_seconds": 20, "language": "en"}
+        )
+        noisy_result = calculate_audio_difficulty(
+            None, noisy, {"duration_seconds": 20, "language": "en"}
+        )
+        assert (
+            noisy_result["factors"]["audioQualityPenalty"]
+            > clean_result["factors"]["audioQualityPenalty"]
+        )
+
+    def test_returns_valid_score_and_required_factors(self):
+        result = calculate_audio_difficulty(
+            None, [_seg("This is a useful practice sentence.", 0.0, 5.0)], {"duration_seconds": 10}
+        )
+        assert 0 <= result["score"] <= 100
+        assert result["level"] in {"A1", "A2", "B1", "B2", "C1", "C2"}
+        assert "avgWordsPerSegment" in result["factors"]
+        assert "wordsPerMinute" in result["factors"]

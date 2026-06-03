@@ -15,7 +15,7 @@ class UserStatsBlock(BaseModel):
     """Aggregated learning stats — computed on read, not persisted."""
 
     total_attempts: int
-    average_score: float           # 0–100, one decimal place
+    average_score: float  # 0–100, one decimal place
     total_vocabulary: int
     current_streak: int
     longest_streak: int
@@ -25,6 +25,7 @@ class UserProfileResponse(BaseModel):
     id: str
     email: str
     display_name: str
+    is_admin: bool = False
     preferred_language: str
     preferences: UserPreferences
     created_at: datetime

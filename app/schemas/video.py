@@ -5,6 +5,10 @@ class LevelAnalysisResponse(BaseModel):
     level: str
     score: float
     features: dict
+    label: str | None = None
+    factors: dict | None = None
+    explanation: list[str] = []
+    recommendedModes: dict | None = None
     error: str | None = None
 
 
@@ -16,6 +20,9 @@ class VideoResponse(BaseModel):
     duration: int
     language: str
     level: str | None
+    difficulty_score: float | None = None
+    difficulty_level: str | None = None
+    difficulty_label: str | None = None
     is_curated: bool
     is_active: bool
     is_auto_generated: bool = False
@@ -33,16 +40,17 @@ class ImportVideoRequest(BaseModel):
     title: str | None = Field(None, description="Custom title (auto-fetched if omitted)")
     channel: str | None = Field(None, description="Channel name (auto-fetched if omitted)")
     language: str = Field("en", description="Language code (e.g., en, ja)")
-    level: str | None = Field(None, description="CEFR level (A1–C2). Auto-detected from transcript if omitted.")
+    level: str | None = Field(
+        None, description="CEFR level (A1–C2). Auto-detected from transcript if omitted."
+    )
     languages: list[str] | None = Field(
         None,
-        description="Preferred transcript languages (defaults to ['en', 'en-US', 'en-GB'] if omitted)"
+        description=(
+            "Preferred transcript languages (defaults to ['en', 'en-US', 'en-GB'] if omitted)"
+        ),
     )
     max_segment_duration: float = Field(
-        10.0,
-        ge=3.0,
-        le=30.0,
-        description="Maximum duration in seconds for each sentence segment"
+        10.0, ge=3.0, le=30.0, description="Maximum duration in seconds for each sentence segment"
     )
 
     model_config = {
@@ -58,6 +66,7 @@ class ImportVideoRequest(BaseModel):
 
 class ImportPartialResponse(BaseModel):
     """Returned when metadata was fetched but transcript extraction failed."""
+
     status: str = "partial"
     video_id: str
     title: str

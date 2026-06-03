@@ -2,18 +2,20 @@
 
 import pytest
 
+from app.core.exceptions import BadRequestError
 from app.services.youtube_service import (
     TranscriptSegment,
     clean_transcript_text,
+    count_words,
     extract_video_id,
     get_full_text,
     merge_segments_by_duration,
     merge_segments_smart,
+    process_transcript_segments,
 )
-from app.core.exceptions import BadRequestError
-
 
 # ─── extract_video_id ─────────────────────────────────────────────
+
 
 class TestExtractVideoId:
     def test_standard_url(self):
@@ -53,6 +55,7 @@ class TestExtractVideoId:
 
 # ─── clean_transcript_text ────────────────────────────────────────
 
+
 class TestCleanTranscriptText:
     def test_removes_newlines(self):
         assert clean_transcript_text("hello\nworld") == "hello world"
@@ -84,6 +87,7 @@ class TestCleanTranscriptText:
 
 
 # ─── merge_segments_by_duration ───────────────────────────────────
+
 
 def _seg(text: str, start: float, duration: float) -> TranscriptSegment:
     """Helper to create a TranscriptSegment quickly."""
@@ -129,6 +133,7 @@ class TestMergeSegmentsByDuration:
 
 # ─── get_full_text ────────────────────────────────────────────────
 
+
 class TestGetFullText:
     def test_combines_segments(self):
         segs = [_seg("hello", 0.0, 1.0), _seg("world", 1.0, 1.0)]
@@ -139,6 +144,7 @@ class TestGetFullText:
 
 
 # ─── merge_segments_smart ─────────────────────────────────────────
+
 
 class TestMergeSegmentsSmart:
     def test_empty_list(self):
@@ -185,7 +191,7 @@ class TestMergeSegmentsSmart:
     def test_respects_min_duration(self):
         """Very short sentence should NOT trigger flush if under min_duration."""
         segs = [
-            _seg("Hi.", 0.0, 0.5),   # ends with "." but < min_duration
+            _seg("Hi.", 0.0, 0.5),  # ends with "." but < min_duration
             _seg("How are you today?", 0.5, 3.0),
         ]
         merged = merge_segments_smart(segs, max_duration=10.0, min_duration=2.0)
@@ -216,11 +222,60 @@ class TestMergeSegmentsSmart:
         assert merged[0].text == "What is this?"
         assert merged[1].text == "Stop!"
 
+    def test_short_segments_merge_only_within_hard_limit(self):
+        segs = [
+            _seg("I know.", 0.0, 0.8),
+            _seg("You can do it.", 0.8, 1.4),
+        ]
+        merged = process_transcript_segments(segs, mode="dictation")
+        assert len(merged) == 1
+        assert merged[0].text == "I know. You can do it."
+
+    def test_does_not_merge_when_result_exceeds_dictation_limit(self):
+        seg_a = "one two three four five six seven eight nine ten eleven twelve"
+        seg_b = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron"
+        segs = [_seg(seg_a, 0.0, 4.0), _seg(seg_b, 4.2, 4.0)]
+        merged = process_transcript_segments(segs, mode="dictation")
+        assert len(merged) == 2
+        assert all(count_words(seg.text) <= 20 for seg in merged)
+
+    def test_long_segment_splits_to_dictation_limit(self):
+        text = " ".join(f"word{i}" for i in range(40))
+        segments = process_transcript_segments([_seg(text, 0.0, 20.0)], mode="dictation")
+        assert len(segments) >= 2
+        assert all(count_words(seg.text) <= 20 for seg in segments)
+
+    def test_split_preserves_timestamp_order(self):
+        text = " ".join(f"word{i}" for i in range(40))
+        segments = process_transcript_segments([_seg(text, 10.0, 20.0)], mode="dictation")
+        for current, nxt in zip(segments, segments[1:]):
+            assert current.start < current.end
+            assert current.end <= nxt.start
+
+    def test_long_pause_prevents_over_merge(self):
+        segs = [_seg("Short line.", 0.0, 0.8), _seg("Another short line.", 3.0, 1.0)]
+        merged = process_transcript_segments(segs, mode="dictation")
+        assert len(merged) == 2
+
+    def test_word_ordering_limit_is_shorter_than_dictation(self):
+        text = (
+            "one two three four five six seven eight nine ten eleven twelve "
+            "thirteen fourteen fifteen sixteen"
+        )
+        dictation = process_transcript_segments([_seg(text, 0.0, 8.0)], mode="dictation")
+        ordering = process_transcript_segments([_seg(text, 0.0, 8.0)], mode="word_ordering")
+        assert max(count_words(seg.text) for seg in ordering) <= 14
+        assert max(count_words(seg.text) for seg in ordering) <= max(
+            count_words(seg.text) for seg in dictation
+        )
+
 
 # ─── get_video_metadata (import check only) ──────────────────────
+
 
 class TestGetVideoMetadata:
     def test_function_is_importable(self):
         """Verify the function exists and can be imported."""
         from app.services.youtube_service import get_video_metadata
+
         assert callable(get_video_metadata)
