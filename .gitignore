@@ -1,26 +1,75 @@
-# Byte-compiled
+# ─────────────── Python ───────────────
 __pycache__/
 *.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 
-# Virtual env
+# ─────────────── Virtual envs ───────────────
 .venv/
 venv/
+env/
+ENV/
 
-# Environment
+# ─────────────── Environment & secrets ───────────────
+# Never commit real env or credentials. Templates are kept (negated below).
 .env
+.env.*
+!.env.example
+!.env.production.example
 
-# IDE
+secrets/
+cookies.txt
+gcp-credentials.json
+gen-lang-client-*.json
+*-credentials.json
+*.pem
+*.key
+
+# ─────────────── Database / runtime data ───────────────
+db_data/
+*.sqlite3
+*.db
+
+# ─────────────── Logs ───────────────
+logs/
+*.log
+server.log
+
+# ─────────────── Generated artifacts (scripts/) ───────────────
+# STT/transcript/demo outputs produced locally — not source.
+scripts/*.mp3
+scripts/*.srt
+scripts/*.csv
+scripts/transcript*.json
+scripts/sentences_*.json
+subtitles_output.txt
+
+# ─────────────── Editors / IDE ───────────────
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
 
-# Distribution
-dist/
-*.egg-info/
-
-# OS
+# ─────────────── OS ───────────────
 .DS_Store
+Thumbs.db
 
-.db_data/
-.scripts/
+# ─────────────── AI / agent tooling (local only) ───────────────
+.claude/
+.agent/
+.codegraph/
+.cursor/
+.gemini/
+.mcp.json
+
+# ─────────────── Project scratch ───────────────
 task.md
-.claude

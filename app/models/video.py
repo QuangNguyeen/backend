@@ -1,7 +1,18 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, Integer, Boolean, DateTime, Float, Text, ForeignKey, Index, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -20,25 +31,46 @@ class Video(Base):
     is_curated: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_auto_generated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    transcription_status: Mapped[str] = mapped_column(String(20), default="ready", nullable=False, server_default="ready")
+    transcription_status: Mapped[str] = mapped_column(
+        String(20), default="ready", nullable=False, server_default="ready"
+    )
     transcription_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    difficulty_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    difficulty_level: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    difficulty_label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    difficulty_factors: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    difficulty_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    avg_words_per_segment: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_words_per_segment: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    words_per_minute: Mapped[float | None] = mapped_column(Float, nullable=True)
+    segment_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_word_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     thumbnail_url: Mapped[str] = mapped_column(String(500), default="")
-    created_by: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    transcripts: Mapped[list["Transcript"]] = relationship(back_populates="video", cascade="all, delete-orphan")
+    transcripts: Mapped[list["Transcript"]] = relationship(
+        back_populates="video", cascade="all, delete-orphan"
+    )
 
 
 class Transcript(Base):
     """Renamed from Sentence to match SRS 7.2.4 'transcripts' table.
-    
+
     SRS defines segments as JSONB, but current implementation uses row-per-segment
     which is already working. Keeping this approach with the correct table/class name.
     """
+
     __tablename__ = "transcripts"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    video_id: Mapped[str] = mapped_column(String(36), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False)
+    video_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False
+    )
     language: Mapped[str] = mapped_column(String(10), nullable=False, default="en")
     index: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -47,6 +79,4 @@ class Transcript(Base):
 
     video: Mapped["Video"] = relationship(back_populates="transcripts")
 
-    __table_args__ = (
-        Index("idx_transcripts_video_language", "video_id", "language"),
-    )
+    __table_args__ = (Index("idx_transcripts_video_language", "video_id", "language"),)

@@ -1,5 +1,6 @@
-from pydantic import BaseModel
 from datetime import datetime
+
+from pydantic import BaseModel
 
 
 class SaveWordRequest(BaseModel):
@@ -89,3 +90,22 @@ class WordPreviewResponse(BaseModel):
 class BatchPreviewRequest(BaseModel):
     words: list[str]
     context: str | None = None
+
+
+class ImportResultResponse(BaseModel):
+    job_id: str | None = None  # None if enrich=False
+    imported: int
+    updated: int
+    errors: list[dict]
+    total_words: int
+    enrich_queued: bool
+
+
+class ImportJobStatus(BaseModel):
+    job_id: str
+    status: str  # "pending" | "processing" | "completed" | "failed"
+    total: int
+    enriched: int
+    phase: str  # "meanings" | "audio" | "translations" | "done"
+    progress_pct: int  # 0-100
+    error: str | None = None

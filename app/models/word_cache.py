@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, Text, DateTime, UniqueConstraint, func
+from sqlalchemy import DateTime, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -9,9 +9,7 @@ from app.database import Base
 
 class WordCache(Base):
     __tablename__ = "word_cache"
-    __table_args__ = (
-        UniqueConstraint("word", "context_hash", name="uq_word_cache_word_context"),
-    )
+    __table_args__ = (UniqueConstraint("word", "context_hash", name="uq_word_cache_word_context"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     word: Mapped[str] = mapped_column(String(200), nullable=False, index=True)

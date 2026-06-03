@@ -1,35 +1,45 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from datetime import UTC, datetime
+
+from fastapi import APIRouter, Depends, status
 from fastapi.security import OAuth2PasswordRequestForm
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 
 from app.api.deps import get_current_user
+from app.config import get_settings
+from app.core.exceptions import ConflictError, UnauthorizedError
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    hash_password,
+    verify_password,
+)
 from app.database import get_db
 from app.models.user import User
 from app.schemas.auth import (
-    LoginRequest, RegisterRequest, TokenResponse, UserResponse, RefreshRequest,
     GoogleLoginRequest,
+    RefreshRequest,
+    RegisterRequest,
+    TokenResponse,
+    UserResponse,
 )
-from app.core.security import (
-    hash_password, verify_password, create_access_token, create_refresh_token, decode_token,
-)
-from app.core.exceptions import ConflictError, UnauthorizedError
-from app.config import get_settings
-from google.oauth2 import id_token as google_id_token
-from google.auth.transport import requests as google_requests
+from app.utils.email import normalize_email
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    # Check existing
-    result = await db.execute(select(User).where(User.email == body.email))
+    email = normalize_email(str(body.email))
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
     if result.scalar_one_or_none():
         raise ConflictError("Email already registered")
 
     user = User(
-        email=body.email,
+        email=email,
         display_name=body.display_name,
         password_hash=hash_password(body.password),
         preferred_language=body.preferred_language,
@@ -45,11 +55,23 @@ async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(User).where(User.email == form_data.username))
+    email = normalize_email(form_data.username)
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
     user = result.scalar_one_or_none()
 
-    if not user or not user.password_hash or not verify_password(form_data.password, user.password_hash):
+    if not user:
         raise UnauthorizedError("Invalid email or password")
+    if not user.is_active:
+        raise UnauthorizedError("Account is deactivated")
+    if not user.password_hash:
+        raise UnauthorizedError(
+            "This account has no password set. Use Google sign-in or ask an admin to set one."
+        )
+    if not verify_password(form_data.password, user.password_hash):
+        raise UnauthorizedError("Invalid email or password")
+
+    user.last_login_at = datetime.now(UTC)
+    await db.commit()
 
     access_token = create_access_token({"sub": user.id})
     refresh_token = create_refresh_token({"sub": user.id})
@@ -88,7 +110,9 @@ async def google_login(body: GoogleLoginRequest, db: AsyncSession = Depends(get_
     user = result.scalar_one_or_none()
 
     if not user:
-        result = await db.execute(select(User).where(User.email == email))
+        result = await db.execute(
+            select(User).where(func.lower(User.email) == normalize_email(email))
+        )
         user = result.scalar_one_or_none()
 
         if user:
@@ -103,8 +127,7 @@ async def google_login(body: GoogleLoginRequest, db: AsyncSession = Depends(get_
             )
             db.add(user)
 
-    from datetime import datetime, timezone
-    user.last_login_at = datetime.now(timezone.utc)
+    user.last_login_at = datetime.now(UTC)
 
     await db.commit()
     await db.refresh(user)

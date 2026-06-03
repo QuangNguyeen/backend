@@ -1,7 +1,18 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, Integer, Float, Text, DateTime, ForeignKey, Index, JSON, UniqueConstraint, func
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -9,10 +20,13 @@ from app.database import Base
 
 class DictationAttempt(Base):
     """Renamed from DictationSession to match SRS 7.2.5 'dictation_attempts' table."""
+
     __tablename__ = "dictation_attempts"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
     video_id: Mapped[str] = mapped_column(String(36), ForeignKey("videos.id"), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="in_progress")
     practice_mode: Mapped[str] = mapped_column(String(20), default="sentence", nullable=False)
@@ -42,11 +56,15 @@ class DictationAttempt(Base):
 
 class DictationSentence(Base):
     """Renamed from SentenceResult to match SRS 7.2.6 'dictation_sentences' table."""
+
     __tablename__ = "dictation_sentences"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     attempt_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("dictation_attempts.id", ondelete="CASCADE"), nullable=False, index=True
+        String(36),
+        ForeignKey("dictation_attempts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     sentence_index: Mapped[int] = mapped_column(Integer, nullable=False)
     original_text: Mapped[str] = mapped_column(Text, nullable=False, default="")

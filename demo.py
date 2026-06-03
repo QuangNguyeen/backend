@@ -4,7 +4,9 @@ url = 'https://www.youtube.com/watch?v=hXzcyx9V0xw'
 video_id = extract_video_id(url)
 print(f'Video ID: {video_id}')
 
-segments = get_transcript(video_id)
+result = get_transcript(video_id)
+segments = result.segments
+print(f'is_generated: {result.is_generated}')
 
 merged = merge_segments_smart(segments, max_duration=10.0)
 print(f'\n🎯 Smart merged: {len(merged)} segments')

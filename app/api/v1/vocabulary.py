@@ -1,35 +1,73 @@
 import asyncio
+import csv
 import hashlib
 import io
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-import csv
-
-from fastapi import APIRouter, BackgroundTasks, Depends, Request, UploadFile, File, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import async_session, get_db
 from app.api.deps import get_current_user
+from app.core.exceptions import BadRequestError, NotFoundError
+from app.database import async_session, get_db
+from app.models.import_job import ImportJob
 from app.models.user import User
 from app.models.vocabulary import SavedWord
 from app.models.word_cache import WordCache
 from app.schemas.vocabulary import (
-    SaveWordRequest, UpdateWordRequest, SavedWordResponse,
-    ReviewRequest, ReviewResponse,
-    FlashCardResponse, DueCardsResponse, WordPreviewResponse,
     BatchPreviewRequest,
-)
-from app.services.srs_service import calculate_next_review
-from app.services.llm_service import (
-    fetch_dictionary_data, google_translate,
-    DictionaryResult, _TTS_FALLBACK_PREFIX,
+    DueCardsResponse,
+    FlashCardResponse,
+    ImportJobStatus,
+    ImportResultResponse,
+    ReviewRequest,
+    ReviewResponse,
+    SavedWordResponse,
+    SaveWordRequest,
+    UpdateWordRequest,
+    WordPreviewResponse,
 )
 from app.services.level_service import _get_nlp
-from app.core.exceptions import NotFoundError
+from app.services.llm_service import (
+    _TTS_FALLBACK_PREFIX,
+    DictionaryResult,
+    fetch_dictionary_data,
+    google_translate,
+)
+from app.services.srs_service import calculate_next_review
+
+MAX_IMPORT_WORDS = 100
+
+# Maps known header aliases (lowercased) to a canonical SavedWord field.
+_COLUMN_ALIASES: dict[str, set[str]] = {
+    "word": {"word", "term", "vocab", "vocabulary", "english", "en"},
+    "meaning": {
+        "meaning",
+        "definition",
+        "translation",
+        "trans",
+        "vietnamese",
+        "vi",
+        "nghia",
+        "nghĩa",
+        "ý nghĩa",
+    },
+    "phonetic": {"phonetic", "ipa", "pronunciation", "phiên âm"},
+    "part_of_speech": {"part_of_speech", "pos", "type", "word_type", "loại từ", "từ loại"},
+    "note": {"note", "notes", "comment", "ghi chú"},
+    "context_sentence": {
+        "context_sentence",
+        "context",
+        "sentence",
+        "example",
+        "câu ví dụ",
+        "ví dụ",
+    },
+}
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +143,7 @@ _TRANSLATE_CACHE_MAX = 2000
 async def _translate_sentence(sentence: str) -> str | None:
     """Translate with in-memory cache (same sentences reappear across users)."""
     import time
+
     cached = _translate_cache.get(sentence)
     if cached and (time.monotonic() - cached[0]) < _TRANSLATE_CACHE_TTL:
         return cached[1]
@@ -138,10 +177,12 @@ async def _enrich_and_persist(
     try:
         async with async_session() as session:
             result = await session.execute(
-                select(WordCache).where(
+                select(WordCache)
+                .where(
                     WordCache.word == word_text,
                     WordCache.vietnamese_meaning.isnot(None),
-                ).limit(1)
+                )
+                .limit(1)
             )
             cached = result.scalar_one_or_none()
             if cached:
@@ -168,21 +209,22 @@ async def _enrich_and_persist(
 
     if not audio_url:
         from urllib.parse import quote
+
         audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(word_text)}"
 
     context_translation: str | None = None
     if context_sentence:
         context_translation = await _translate_sentence(context_sentence)
 
-    have_any = any(v is not None for v in (phonetic, audio_url, display_meaning, context_translation))
+    have_any = any(
+        v is not None for v in (phonetic, audio_url, display_meaning, context_translation)
+    )
     if not have_any:
         return
 
     try:
         async with async_session() as session:
-            result = await session.execute(
-                select(SavedWord).where(SavedWord.id == saved_word_id)
-            )
+            result = await session.execute(select(SavedWord).where(SavedWord.id == saved_word_id))
             saved = result.scalar_one_or_none()
             if saved is not None:
                 if phonetic is not None:
@@ -202,16 +244,20 @@ async def _enrich_and_persist(
     # Persist to global cache — only store actual Vietnamese, never English fallback
     try:
         async with async_session() as session:
-            stmt = pg_insert(WordCache).values(
-                word=word_text,
-                context_hash="__global__",
-                phonetic=phonetic,
-                audio_url=audio_url,
-                vietnamese_meaning=vietnamese_meaning,
-                part_of_speech=part_of_speech,
-                context_translation=context_translation,
-            ).on_conflict_do_nothing(
-                index_elements=["word", "context_hash"],
+            stmt = (
+                pg_insert(WordCache)
+                .values(
+                    word=word_text,
+                    context_hash="__global__",
+                    phonetic=phonetic,
+                    audio_url=audio_url,
+                    vietnamese_meaning=vietnamese_meaning,
+                    part_of_speech=part_of_speech,
+                    context_translation=context_translation,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=["word", "context_hash"],
+                )
             )
             await session.execute(stmt)
             await session.commit()
@@ -244,10 +290,12 @@ async def save_word(
 
     # Global word-level cache lookup
     cache_result = await db.execute(
-        select(WordCache).where(
+        select(WordCache)
+        .where(
             WordCache.word == lemma,
             WordCache.vietnamese_meaning.isnot(None),
-        ).limit(1)
+        )
+        .limit(1)
     )
     cached = cache_result.scalar_one_or_none()
 
@@ -312,7 +360,7 @@ async def save_word(
             audio_url=audio_url,
             context_translation=context_translation,
             part_of_speech=part_of_speech,
-            next_review_at=datetime.now(timezone.utc),
+            next_review_at=datetime.now(UTC),
         )
         db.add(word)
         await db.commit()
@@ -359,7 +407,7 @@ async def get_due_cards(
     db: AsyncSession = Depends(get_db),
 ):
     """Get FlashCards due for review today."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     result = await db.execute(
         select(SavedWord)
         .where(
@@ -407,17 +455,21 @@ async def preview_word(
     # ── Parallel DB queries: is_saved + cache lookup ──
     saved_result, cache_result = await asyncio.gather(
         db.execute(
-            select(SavedWord.id).where(
+            select(SavedWord.id)
+            .where(
                 SavedWord.user_id == current_user.id,
                 SavedWord.word == lemma,
                 SavedWord.deleted_at.is_(None),
-            ).limit(1)
+            )
+            .limit(1)
         ),
         db.execute(
-            select(WordCache).where(
+            select(WordCache)
+            .where(
                 WordCache.word == lemma,
                 WordCache.vietnamese_meaning.isnot(None),
-            ).limit(1)
+            )
+            .limit(1)
         ),
     )
     is_saved = saved_result.scalar() is not None
@@ -462,6 +514,7 @@ async def preview_word(
     audio_url = dict_data.audio_url
     if not audio_url:
         from urllib.parse import quote
+
         audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(lemma)}"
 
     # Persist to global cache — only store actual Vietnamese as vietnamese_meaning
@@ -476,9 +529,13 @@ async def preview_word(
         )
         if context_translation is not None:
             cache_values["context_translation"] = context_translation
-        stmt = pg_insert(WordCache).values(
-            **cache_values,
-        ).on_conflict_do_nothing(index_elements=["word", "context_hash"])
+        stmt = (
+            pg_insert(WordCache)
+            .values(
+                **cache_values,
+            )
+            .on_conflict_do_nothing(index_elements=["word", "context_hash"])
+        )
         await db.execute(stmt)
         await db.commit()
     except Exception as e:
@@ -531,10 +588,13 @@ async def preview_words_batch(
     )
     cache_map = {row.word: row for row in cache_result.scalars().all()}
 
-    uncached_lemmas = [l for l in unique_lemmas if l not in cache_map]
+    uncached_lemmas = [lemma for lemma in unique_lemmas if lemma not in cache_map]
     dict_results: dict[str, DictionaryResult] = {}
     if uncached_lemmas:
-        tasks = [fetch_dictionary_data(l, translate_meaning=True) for l in uncached_lemmas]
+        tasks = [
+            fetch_dictionary_data(lemma, translate_meaning=True)
+            for lemma in uncached_lemmas
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for lemma, res in zip(uncached_lemmas, results):
             if isinstance(res, Exception):
@@ -565,6 +625,7 @@ async def preview_words_batch(
             audio_url = dr.audio_url
             if not audio_url:
                 from urllib.parse import quote
+
                 audio_url = f"{_TTS_FALLBACK_PREFIX}{quote(lemma)}"
             out[w] = WordPreviewResponse(
                 word=lemma,
@@ -587,8 +648,12 @@ async def preview_words_batch(
                 )
                 if ctx_translation is not None:
                     cache_vals["context_translation"] = ctx_translation
-                stmt = pg_insert(WordCache).values(**cache_vals).on_conflict_do_nothing(
-                    index_elements=["word", "context_hash"],
+                stmt = (
+                    pg_insert(WordCache)
+                    .values(**cache_vals)
+                    .on_conflict_do_nothing(
+                        index_elements=["word", "context_hash"],
+                    )
                 )
                 await db.execute(stmt)
             except Exception:
@@ -658,7 +723,7 @@ async def review_word(
     word.ease_factor = srs.ease_factor
     word.interval_days = srs.interval_days
     word.next_review_at = srs.next_review_at
-    word.last_reviewed_at = datetime.now(timezone.utc)
+    word.last_reviewed_at = datetime.now(UTC)
 
     await db.commit()
 
@@ -717,7 +782,7 @@ async def delete_word(
     if not word:
         raise NotFoundError("Word not found")
 
-    word.deleted_at = datetime.now(timezone.utc)
+    word.deleted_at = datetime.now(UTC)
     await db.commit()
 
 
@@ -738,7 +803,16 @@ async def export_words(
     writer = csv.writer(buf)
     writer.writerow(["word", "meaning", "phonetic", "part_of_speech", "note", "context_sentence"])
     for w in words:
-        writer.writerow([w.word, w.meaning or "", w.phonetic or "", w.part_of_speech or "", w.note or "", w.context_sentence or ""])
+        writer.writerow(
+            [
+                w.word,
+                w.meaning or "",
+                w.phonetic or "",
+                w.part_of_speech or "",
+                w.note or "",
+                w.context_sentence or "",
+            ]
+        )
 
     buf.seek(0)
     return StreamingResponse(
@@ -748,34 +822,114 @@ async def export_words(
     )
 
 
-@router.post("/import")
+def _build_header_map(headers: list[str]) -> dict[int, str]:
+    """Map column indices to canonical SavedWord fields using header aliases."""
+    mapping: dict[int, str] = {}
+    for idx, raw in enumerate(headers):
+        key = (raw or "").strip().lower()
+        for field, aliases in _COLUMN_ALIASES.items():
+            if key == field or key in aliases:
+                mapping[idx] = field
+                break
+    return mapping
+
+
+def _parse_csv(content: bytes) -> list[dict]:
+    text = content.decode("utf-8-sig")
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        return []
+    header_map = _build_header_map(rows[0])
+    out: list[dict] = []
+    for cells in rows[1:]:
+        record = {}
+        for idx, field in header_map.items():
+            if idx < len(cells):
+                record[field] = (cells[idx] or "").strip()
+        out.append(record)
+    return out
+
+
+def _parse_xlsx(content: bytes) -> list[dict]:
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        header = next(rows_iter)
+    except StopIteration:
+        return []
+    header_map = _build_header_map([str(h) if h is not None else "" for h in header])
+    out: list[dict] = []
+    for cells in rows_iter:
+        record = {}
+        for idx, field in header_map.items():
+            if idx < len(cells) and cells[idx] is not None:
+                record[field] = str(cells[idx]).strip()
+        out.append(record)
+    wb.close()
+    return out
+
+
+def _parse_import_file(filename: str, content: bytes) -> list[dict]:
+    name = (filename or "").lower()
+    if name.endswith(".xlsx") or name.endswith(".xlsm"):
+        return _parse_xlsx(content)
+    return _parse_csv(content)
+
+
+@router.post("/import", response_model=ImportResultResponse)
 async def import_words(
     file: UploadFile = File(...),
+    enrich: bool = Form(False),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Import words from CSV. Expected columns: word, meaning, phonetic, note (all optional except word)."""
+    """Import words from a CSV or XLSX file.
+
+    Columns are auto-detected from the header row (word/term, meaning/definition,
+    phonetic/ipa, part_of_speech/pos, note, context_sentence/example). Only
+    ``word`` is required. Up to 100 words may be imported at once.
+
+    When ``enrich=True``, an ``ImportJob`` is created and a Celery task is queued
+    to fill missing meaning, IPA, audio, and example sentences in the background;
+    the returned ``job_id`` can be polled via ``/import/{job_id}/status``.
+    """
     content = await file.read()
-    text = content.decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(text))
+    try:
+        rows = _parse_import_file(file.filename or "", content)
+    except Exception as e:
+        logger.warning("Import file parse failed: %s", e)
+        raise BadRequestError("Could not parse file. Please upload a valid CSV or XLSX.")
+
+    # Validate size against the per-import cap (count rows that have a word).
+    word_rows = [r for r in rows if (r.get("word") or "").strip()]
+    if len(word_rows) > MAX_IMPORT_WORDS:
+        raise BadRequestError(f"Maximum {MAX_IMPORT_WORDS} words per import")
 
     imported = 0
-    skipped = 0
+    updated = 0
     errors: list[dict] = []
+    existing_ids: list[str] = []
+    new_words: list[SavedWord] = []
 
-    for row_num, row in enumerate(reader, start=2):
+    for row_num, row in enumerate(rows, start=2):
         word_text = (row.get("word") or "").strip().lower()
         if not word_text:
             errors.append({"row": row_num, "error": "missing word"})
             continue
 
-        existing = (await db.execute(
-            select(SavedWord).where(
-                SavedWord.user_id == current_user.id,
-                SavedWord.word == word_text,
-                SavedWord.deleted_at.is_(None),
+        existing = (
+            await db.execute(
+                select(SavedWord).where(
+                    SavedWord.user_id == current_user.id,
+                    SavedWord.word == word_text,
+                    SavedWord.deleted_at.is_(None),
+                )
             )
-        )).scalar_one_or_none()
+        ).scalar_one_or_none()
 
         if existing:
             if row.get("meaning"):
@@ -788,9 +942,11 @@ async def import_words(
                 existing.part_of_speech = row["part_of_speech"].strip()
             if row.get("context_sentence"):
                 existing.context_sentence = row["context_sentence"].strip()
-            skipped += 1
+            updated += 1
+            if enrich:
+                existing_ids.append(existing.id)
         else:
-            db.add(SavedWord(
+            new_word = SavedWord(
                 user_id=current_user.id,
                 word=word_text,
                 meaning=(row.get("meaning") or "").strip() or None,
@@ -799,9 +955,102 @@ async def import_words(
                 part_of_speech=(row.get("part_of_speech") or "").strip() or None,
                 context_sentence=(row.get("context_sentence") or "").strip() or None,
                 source="csv_import",
-                next_review_at=datetime.now(timezone.utc),
-            ))
+                next_review_at=datetime.now(UTC),
+            )
+            db.add(new_word)
             imported += 1
+            if enrich:
+                new_words.append(new_word)
 
     await db.commit()
-    return {"imported": imported, "updated": skipped, "errors": errors}
+
+    # IDs of newly-inserted rows are only populated after the flush/commit above.
+    new_word_ids = existing_ids + [w.id for w in new_words]
+
+    job_id: str | None = None
+    enrich_queued = False
+    if enrich and new_word_ids:
+        job = ImportJob(
+            user_id=current_user.id,
+            status="pending",
+            total_words=len(new_word_ids),
+            phase="meanings",
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+        job_id = job.id
+        try:
+            from app.tasks.vocabulary_enrichment import enrich_imported_words
+
+            enrich_imported_words.delay(job.id, new_word_ids, True)
+            enrich_queued = True
+        except Exception as e:
+            logger.error("Failed to queue enrichment task for job %s: %s", job.id, e)
+            job.status = "failed"
+            job.error = "Could not queue enrichment task"
+            await db.commit()
+
+    return ImportResultResponse(
+        job_id=job_id,
+        imported=imported,
+        updated=updated,
+        errors=errors,
+        total_words=len(word_rows),
+        enrich_queued=enrich_queued,
+    )
+
+
+@router.get("/import/template")
+async def download_template():
+    """Download a sample CSV template with headers and example rows."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["word", "meaning", "phonetic", "part_of_speech", "note", "context_sentence"])
+    writer.writerow(["apple", "quả táo", "/ˈæp.əl/", "noun", "", "I eat an apple every day."])
+    writer.writerow(["resilient", "kiên cường", "/rɪˈzɪl.i.ənt/", "adjective", "", ""])
+    writer.writerow(
+        ["contribute", "đóng góp", "/kənˈtrɪb.juːt/", "verb", "", "He contributes to the team."]
+    )
+    buf.seek(0)
+    return StreamingResponse(
+        io.BytesIO(buf.getvalue().encode("utf-8-sig")),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=vocabulary_template.csv"},
+    )
+
+
+@router.get("/import/{job_id}/status", response_model=ImportJobStatus)
+async def get_import_status(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Poll enrichment progress for an import job."""
+    result = await db.execute(
+        select(ImportJob).where(
+            ImportJob.id == job_id,
+            ImportJob.user_id == current_user.id,
+        )
+    )
+    job = result.scalar_one_or_none()
+    if not job:
+        raise NotFoundError("Import job not found")
+
+    total = job.total_words or 0
+    enriched = min(job.enriched_count or 0, total) if total else 0
+    progress_pct = (
+        int(round((enriched / total) * 100)) if total else (100 if job.status == "completed" else 0)
+    )
+    if job.status == "completed":
+        progress_pct = 100
+
+    return ImportJobStatus(
+        job_id=job.id,
+        status=job.status,
+        total=total,
+        enriched=enriched,
+        phase=job.phase,
+        progress_pct=progress_pct,
+        error=job.error,
+    )

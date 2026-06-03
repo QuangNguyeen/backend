@@ -1,0 +1,32 @@
+# DictaLearn — reverse proxy + auto-HTTPS (Let's Encrypt)
+# Đổi domain theo của bạn. Tạo các bản ghi A trỏ về IP VPS:
+#   api.dictalearn.com, logs.dictalearn.com, status.dictalearn.com
+
+api.dictalearn.com {
+    encode gzip
+
+    # SSE: tắt buffer để /api/v1/events/* stream real-time
+    @sse path /api/v1/events/*
+    reverse_proxy @sse web:8000 {
+        flush_interval -1
+    }
+
+    reverse_proxy web:8000
+}
+
+# Log viewer (Dozzle) — bảo vệ bằng basic-auth.
+# Tạo hash: docker run --rm caddy:2-alpine caddy hash-password --plaintext 'MAT_KHAU'
+logs.dictalearn.com {
+    basic_auth {
+        admin REPLACE_WITH_BCRYPT_HASH
+    }
+    reverse_proxy dozzle:8080
+}
+
+# Uptime monitor (Uptime Kuma).
+status.dictalearn.com {
+    basic_auth {
+        admin REPLACE_WITH_BCRYPT_HASH
+    }
+    reverse_proxy uptime-kuma:3001
+}

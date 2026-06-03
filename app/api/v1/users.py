@@ -1,10 +1,9 @@
 from datetime import date
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 from sqlalchemy import Date, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from pydantic import BaseModel
 
 from app.api.deps import get_current_user
 from app.core.exceptions import BadRequestError
@@ -29,31 +28,39 @@ async def _build_stats(db: AsyncSession, user_id: str) -> UserStatsBlock:
 
     Per-user volumes are small; readability beats a single mega-query.
     """
-    total_attempts = (await db.execute(
-        select(func.count()).where(
-            DictationAttempt.user_id == user_id,
-            DictationAttempt.status == "completed",
+    total_attempts = (
+        await db.execute(
+            select(func.count()).where(
+                DictationAttempt.user_id == user_id,
+                DictationAttempt.status == "completed",
+            )
         )
-    )).scalar() or 0
+    ).scalar() or 0
 
-    avg_raw = (await db.execute(
-        select(func.avg(DictationSentence.score))
-        .join(DictationAttempt)
-        .where(DictationAttempt.user_id == user_id)
-    )).scalar() or 0.0
-
-    total_vocabulary = (await db.execute(
-        select(func.count()).where(
-            SavedWord.user_id == user_id,
-            SavedWord.deleted_at.is_(None),
+    avg_raw = (
+        await db.execute(
+            select(func.avg(DictationSentence.score))
+            .join(DictationAttempt)
+            .where(DictationAttempt.user_id == user_id)
         )
-    )).scalar() or 0
+    ).scalar() or 0.0
 
-    active_rows = (await db.execute(
-        select(cast(DictationAttempt.updated_at, Date))
-        .where(DictationAttempt.user_id == user_id)
-        .group_by(cast(DictationAttempt.updated_at, Date))
-    )).all()
+    total_vocabulary = (
+        await db.execute(
+            select(func.count()).where(
+                SavedWord.user_id == user_id,
+                SavedWord.deleted_at.is_(None),
+            )
+        )
+    ).scalar() or 0
+
+    active_rows = (
+        await db.execute(
+            select(cast(DictationAttempt.updated_at, Date))
+            .where(DictationAttempt.user_id == user_id)
+            .group_by(cast(DictationAttempt.updated_at, Date))
+        )
+    ).all()
     active_dates = {row[0] for row in active_rows if row[0] is not None}
     current_streak, longest_streak = compute_streaks(active_dates, date.today())
 
@@ -76,6 +83,7 @@ def _serialize_profile(user: User, stats: UserStatsBlock) -> UserProfileResponse
         id=user.id,
         email=user.email,
         display_name=user.display_name,
+        is_admin=user.is_admin,
         preferred_language=user.preferred_language,
         preferences=_coerce_preferences(user.preferences),
         created_at=user.created_at,
@@ -130,7 +138,9 @@ async def change_password(
     db: AsyncSession = Depends(get_db),
 ):
     if not current_user.password_hash:
-        raise BadRequestError("Account uses social login — set a password via your profile settings")
+        raise BadRequestError(
+            "Account uses social login — set a password via your profile settings"
+        )
     if not verify_password(body.current_password, current_user.password_hash):
         raise BadRequestError("Current password is incorrect")
     if len(body.new_password) < 6:

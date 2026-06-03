@@ -50,9 +50,9 @@ class DashboardStatsResponse(BaseModel):
 
 
 class HeatmapDay(BaseModel):
-    date: str       # "2026-04-01"
+    date: str  # "2026-04-01"
     count: int
-    level: int      # 0-4 intensity
+    level: int  # 0-4 intensity
 
 
 class AccuracyPoint(BaseModel):

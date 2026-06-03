@@ -1,5 +1,5 @@
-from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 
 @dataclass
@@ -49,7 +49,7 @@ def calculate_next_review(
         ease_factor + 0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02),
     )
 
-    next_review_at = datetime.now(timezone.utc) + timedelta(days=interval_days)
+    next_review_at = datetime.now(UTC) + timedelta(days=interval_days)
 
     return SRSResult(
         repetitions=repetitions,

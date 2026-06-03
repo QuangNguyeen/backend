@@ -1,36 +1,49 @@
-
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000 "$@"
-echo "Starting uvicorn server..."
-# Start the application
-
-fi
-    alembic upgrade head
-    echo "Running database migrations..."
-if [ -f "alembic.ini" ]; then
-# Run database migrations (if alembic is configured)
-
-echo "Database is ready!"
-done
-    sleep 2
-    echo "Database is not ready yet, waiting..."
-" 2>/dev/null; do
-exit(0 if asyncio.run(check()) else 1)
-        return False
-    except:
-        return True
-        await conn.close()
-        conn = await asyncpg.connect('${DATABASE_URL}'.replace('+asyncpg', ''))
-    try:
-async def check():
-import asyncpg
-import asyncio
-while ! python -c "
-echo "Waiting for database..."
-# Wait for database to be ready
+#!/usr/bin/env bash
+# DictaLearn Backend - Docker Entrypoint (web container)
+set -e
 
 echo "Starting DictaLearn Backend..."
 
-set -e
+echo "Waiting for database..."
+python - <<'PY'
+import asyncio
+import os
+import sys
+import time
 
-# DictaLearn Backend - Docker Entrypoint Script
+import asyncpg
 
+url = os.environ["DATABASE_URL"].replace("+asyncpg", "")
+
+
+async def check() -> bool:
+    try:
+        conn = await asyncpg.connect(url)
+        await conn.close()
+        return True
+    except Exception:
+        return False
+
+
+for _ in range(60):
+    if asyncio.run(check()):
+        print("Database is ready!")
+        sys.exit(0)
+    print("DB not ready, waiting...")
+    time.sleep(2)
+
+print("Database never became ready")
+sys.exit(1)
+PY
+
+# Only the web container runs migrations (worker sets RUN_MIGRATIONS=0 to avoid a race).
+if [ "${RUN_MIGRATIONS:-1}" = "1" ]; then
+    echo "Running alembic upgrade head..."
+    alembic upgrade head
+fi
+
+echo "Starting uvicorn server..."
+exec uvicorn app.main:app \
+    --host 0.0.0.0 --port 8000 \
+    --workers "${UVICORN_WORKERS:-4}" \
+    --proxy-headers --forwarded-allow-ips '*'

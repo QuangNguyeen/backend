@@ -47,9 +47,15 @@ google-genai>=1.0.0
 # AssemblyAI
 assemblyai>=0.37.0
 
+# Real-time events
+sse-starlette>=2.0.0
+
 # Task queue
 celery[redis]>=5.4.0
 redis>=5.0.0
 
 # Sync DB driver (for Celery workers)
 psycopg2-binary>=2.9.9
+
+# Excel parsing (vocabulary import)
+openpyxl>=3.1.0

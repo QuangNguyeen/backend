@@ -25,6 +25,7 @@ class UserResponse(BaseModel):
     display_name: str
     preferred_language: str
     streak_days: int
+    is_admin: bool = False
 
     model_config = {"from_attributes": True}
 
