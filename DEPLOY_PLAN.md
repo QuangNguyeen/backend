@@ -19,7 +19,7 @@ hạ tầng này.
 Các tài nguyên deploy hiện có trong repo đang là stub/hỏng và cần làm lại:
 - `Dockerfile` chỉ là placeholder (`FROM ubuntu; ENTRYPOINT top`).
 - `scripts/docker-entrypoint.sh` bị đảo/lỗi thứ tự dòng; `scripts/start.sh` rỗng.
-- `docker-compose.local-ci.yml` là cấu hình Jenkins/nginx cho local, không phải production.
+- ~~`docker-compose.local-ci.yml` là cấu hình Jenkins/nginx cho local~~ — **đã xóa**; thay bằng `docker-compose.prod.yml` + Caddy + GitHub Actions.
 - `.dockerignore` **chưa** loại trừ `db_data/`, `cookies.txt`, hay file JSON credential của GCP.
 
 ## Ngân sách (mục tiêu ≤ 20$/tháng)

@@ -11,7 +11,7 @@ backend/
 ├── alembic.ini
 ├── cookies.txt
 ├── demo.py
-├── docker-compose.local-ci.yml
+├── docker-compose.prod.yml
 ├── fetch_subtitles.py
 ├── pyproject.toml
 ├── requirements.txt
@@ -88,12 +88,6 @@ backend/
 │       └── transcription.py
 ├── migrations/
 │   └── versions/
-├── nginx/
-│   ├── nginx.conf
-│   ├── conf.d/
-│   │   └── default.conf
-│   └── ssl/
-│       └── .gitkeep
 ├── scripts/
 │   ├── DemoDictationUseLLM.mp3
 │   ├── clean_dirty_data.py
