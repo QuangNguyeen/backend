@@ -26,15 +26,18 @@ Các tài nguyên deploy hiện có trong repo đang là stub/hỏng và cần l
 
 | Hạng mục | Lựa chọn | ~Chi phí/tháng |
 |------|--------|----------|
-| VPS | **Hetzner CX22** (2 vCPU / 4 GB / 40 GB, đã gồm IPv4) | ~5.50$ |
-| Auto-backup | Snapshot Hetzner (+20%) | ~1.10$ |
+| VPS | **Hetzner CX32** (4 vCPU / 8 GB / 80 GB) | ~9.2$ |
+| Primary IPv4 | Hetzner tính riêng (~€0.50) | ~0.55$ |
+| Auto-backup | Snapshot Hetzner (+20% giá server) | ~1.85$ |
 | Domain | TLD giá rẻ, tính trung bình theo tháng (xem bên dưới) | ~1$ |
-| **Tổng hạ tầng** | | **~8$/tháng** |
-| Dư ngân sách | Nâng lên CPX21 (4 GB AMD) hoặc CX32 (8 GB) nếu STT/audio cần thêm RAM | tối đa ~11$ |
+| **Tổng hạ tầng** | | **~12.5$/tháng** |
+| Dư ngân sách | Vẫn dưới 20$; có thể hạ về CX22 (4 GB) nếu muốn tiết kiệm | ~7.5$ |
 
-4 GB RAM là mức cân bằng lý tưởng: model spaCy (~50 MB resident) + file audio tạm + Postgres +
-Redis chạy thoải mái. Máy 2 GB sẽ cần swap và có nguy cơ OOM khi transcribe, nên khuyến nghị
-4 GB. **Nhà cung cấp thay thế:** droplet DigitalOcean 12$ (2 GB) — dùng được nhưng nên thêm swap.
+8 GB RAM (CX32) cho biên an toàn rộng rãi: model spaCy (~50 MB resident) + nhiều file audio tạm +
+Postgres + Redis chạy thoải mái, gần như loại bỏ nguy cơ OOM khi transcribe video dài, và cho phép
+nâng worker lên `--concurrency=2` nếu cần. **Lưu ý location:** dòng CX (Intel) chỉ có ở EU; nếu đặt
+Singapore/US thì cấu hình 8 GB tương đương là **CPX31** (4 vCPU AMD / 8 GB / 160 GB, ~13.5$). Vẫn
+giữ 2 GB swap như lưới an toàn cuối cùng.
 
 ### Gợi ý domain
 - **Cloudflare Registrar** — bán đúng giá gốc, không cộng phí (~10$/năm cho `.com`), kèm DNS
@@ -131,8 +134,8 @@ Khởi tạo server lần đầu: tạo user sudo non-root, cài Docker + compos
 3. **Mức song song của worker** — `--pool=solo` = mỗi lần một transcription. Phù hợp với máy
    nhỏ; video dài sẽ chặn hàng đợi. Chấp nhận được cho MVP; chỉ cân nhắc `--concurrency=2`
    (prefork) nếu RAM cho phép.
-4. **Bộ nhớ** — theo dõi RSS khi transcribe; 2 GB swap là lưới an toàn. Nâng lên CPX21/CX32
-   (vẫn ≤ 20$) nếu bị OOM.
+4. **Bộ nhớ** — CX32 (8 GB) đã dư biên cho STT; 2 GB swap vẫn giữ làm lưới an toàn cuối. Nếu sau
+   này vẫn bị OOM với video rất dài, nâng lên CX42 (16 GB) hoặc CPX41 (vẫn ≤ 20$).
 5. **Tranh chấp migration** — chỉ entrypoint của web chạy `alembic upgrade head`; worker chờ
    healthcheck của DB và không chạy migration.
 6. **Backup DB** — bật auto-backup của Hetzner *và* thêm cron `pg_dump` hằng đêm đẩy ra nơi lưu

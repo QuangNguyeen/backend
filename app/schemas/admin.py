@@ -30,6 +30,11 @@ class AdminVideoResponse(BaseModel):
     difficulty_factors: dict | None = None
     is_curated: bool
     is_active: bool
+    publish_status: str = "published"
+    published_at: datetime | None = None
+    reviewed_by: str | None = None
+    reviewed_at: datetime | None = None
+    review_note: str | None = None
     is_auto_generated: bool
     transcription_status: str
     transcription_error: str | None

@@ -665,6 +665,9 @@ def merge_segments_smart(
             current_duration = 0.0
 
     for segment in segments:
+        if not current_texts:
+            current_start = segment.start
+
         would_be_duration = (segment.start + segment.duration) - current_start
         candidate_word_count = count_words(" ".join([*current_texts, segment.text]))
 
@@ -684,9 +687,6 @@ def merge_segments_smart(
 
         if ends_with_sentence and current_duration >= min_duration:
             _flush()
-
-        if not current_texts:
-            current_start = segment.start + segment.duration
 
     _flush()
     return validate_segments(merged, mode=mode)

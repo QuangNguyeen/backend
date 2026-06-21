@@ -1,3 +1,6 @@
+from collections.abc import AsyncGenerator
+
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -18,9 +21,14 @@ class Base(DeclarativeBase):
     pass
 
 
-async def get_db():
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    # The async context manager already closes the session on exit.
     async with async_session() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
+        yield session
+
+
+async def check_database() -> bool:
+    """Lightweight connectivity probe for readiness checks."""
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+    return True

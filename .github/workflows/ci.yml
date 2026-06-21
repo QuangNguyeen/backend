@@ -1,0 +1,26 @@
+name: CI
+
+# Lint + tests on pull requests and feature-branch pushes.
+# Pushes to main are gated by the Deploy workflow's test job.
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Download spaCy model
+        run: python -m spacy download en_core_web_sm
+      - name: Lint
+        run: ruff check app tests
+      - name: Test
+        run: pytest -q

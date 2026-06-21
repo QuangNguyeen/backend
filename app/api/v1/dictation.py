@@ -1,22 +1,13 @@
-import math
-import random
-import re
-from datetime import UTC, datetime
 from enum import StrEnum
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func as sa_func
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
-from app.core.exceptions import BadRequestError, NotFoundError
 from app.database import get_db
-from app.models.dictation import DictationAttempt, DictationSentence
 from app.models.user import User
-from app.models.video import Transcript, Video
+from app.repositories.dictation_repository import DictationRepository
 from app.schemas.cloze import (
-    ClozeBlankResult,
     ClozeChunksResponse,
     ClozeFullResponse,
     ClozeResultResponse,
@@ -24,34 +15,22 @@ from app.schemas.cloze import (
     ClozeSubmitAllResponse,
     ClozeSubmitRequest,
     PracticeMode,
-    SegmentScore,
 )
 from app.schemas.dictation import (
-    HistoryAttemptResponse,
     HistoryPaginatedResponse,
     SentenceResultResponse,
     SubmitAnswerRequest,
-    WordDiffItem,
 )
 from app.schemas.reorder import (
-    ReorderChallenge,
     ReorderChallengesResponse,
     ReorderSentenceResult,
     ReorderSubmitAllRequest,
     ReorderSubmitAllResponse,
     ReorderSubmitRequest,
-    ReorderToken,
-    ReorderTokenResult,
 )
-from app.services.cloze_service import (
-    build_chunks,
-    build_full_cloze,
-    get_chunk_answers,
-    get_full_cloze_answers,
-)
-from app.services.dictation_service import compute_word_diff
-from app.services.text_analysis_service import get_word_difficulty_map
-from app.services.youtube_service import TranscriptSegment, process_transcript_segments
+from app.services.dictation_session_service import DictationService
+
+router = APIRouter(prefix="/dictation", tags=["Dictation"])
 
 
 class AttemptStatus(StrEnum):
@@ -59,88 +38,8 @@ class AttemptStatus(StrEnum):
     completed = "completed"
 
 
-def _populate_analytics(attempt: DictationAttempt, all_sentences: list[DictationSentence]):
-    """Fill duration_seconds, error_summary, total_words, correct_words on completion."""
-    if attempt.created_at and attempt.completed_at:
-        delta = attempt.completed_at - attempt.created_at
-        attempt.duration_seconds = int(delta.total_seconds())
-
-    total_correct = 0
-    total_wrong = 0
-    total_missing = 0
-    word_error_counts: dict[str, int] = {}
-
-    for sentence in all_sentences:
-        if not sentence.word_diff:
-            continue
-        for item in sentence.word_diff:
-            status = item.get("status", "")
-            if status == "correct":
-                total_correct += 1
-            elif status in ("wrong", "missing"):
-                if status == "wrong":
-                    total_wrong += 1
-                else:
-                    total_missing += 1
-                word = item.get("expected") or item.get("word") or ""
-                word = word.strip().lower()
-                if word:
-                    word_error_counts[word] = word_error_counts.get(word, 0) + 1
-
-    total_words = total_correct + total_wrong + total_missing
-    attempt.total_words = total_words
-    attempt.correct_words = total_correct
-
-    top_words = sorted(word_error_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-    attempt.error_summary = {
-        "top_words": [{"word": w, "count": c} for w, c in top_words],
-        "total_wrong": total_wrong,
-        "total_missing": total_missing,
-    }
-
-
-router = APIRouter(prefix="/dictation", tags=["Dictation"])
-
-
-def _transcript_to_segment(transcript: Transcript) -> TranscriptSegment:
-    duration = max(0.001, float(transcript.end_time - transcript.start_time))
-    return TranscriptSegment(
-        text=transcript.text,
-        start=float(transcript.start_time),
-        duration=duration,
-    )
-
-
-def _segments_for_practice_mode(
-    transcripts: list[Transcript], practice_mode: PracticeMode
-) -> list[TranscriptSegment]:
-    raw_segments = [_transcript_to_segment(transcript) for transcript in transcripts]
-    if practice_mode == "reorder":
-        return process_transcript_segments(raw_segments, mode="word_ordering")
-    if practice_mode == "cloze":
-        return process_transcript_segments(raw_segments, mode="cloze")
-    return process_transcript_segments(raw_segments, mode="dictation")
-
-
-def _total_sentences_for_mode(
-    transcripts: list[Transcript], practice_mode: PracticeMode
-) -> int:
-    if practice_mode == "reorder":
-        return len(_segments_for_practice_mode(transcripts, practice_mode))
-    return len(transcripts)
-
-
-def _session_payload(
-    attempt: DictationAttempt, *, resumed: bool, sentence_results: list[dict]
-) -> dict:
-    return {
-        "session_id": attempt.id,
-        "total_sentences": attempt.total_sentences,
-        "current_sentence_index": attempt.current_sentence_index if resumed else 0,
-        "resumed": resumed,
-        "sentence_results": sentence_results,
-        "practice_mode": attempt.practice_mode,
-    }
+def get_dictation_service(db: AsyncSession = Depends(get_db)) -> DictationService:
+    return DictationService(DictationRepository(db))
 
 
 @router.post("/sessions", status_code=201)
@@ -148,100 +47,9 @@ async def create_session(
     video_id: str,
     practice_mode: PracticeMode = "sentence",
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
-    # Count transcripts (sentences)
-    result = await db.execute(select(Transcript).where(Transcript.video_id == video_id))
-    transcripts = result.scalars().all()
-    if not transcripts:
-        raise NotFoundError("No transcripts found for this video")
-
-    total_sentences = _total_sentences_for_mode(transcripts, practice_mode)
-
-    # Check for existing attempt for this user + video
-    result = await db.execute(
-        select(DictationAttempt).where(
-            DictationAttempt.user_id == current_user.id,
-            DictationAttempt.video_id == video_id,
-        )
-    )
-    attempt = result.scalar_one_or_none()
-
-    if attempt and attempt.status == "in_progress":
-        # Mode-switch detection: if the user picked a different mode, reset
-        # the in-progress session rather than resuming with stale data.
-        if attempt.practice_mode != practice_mode:
-            attempt.score = None
-            attempt.current_sentence_index = 0
-            attempt.total_sentences = total_sentences
-            attempt.practice_mode = practice_mode
-            attempt.error_summary = None
-            attempt.completed_at = None
-            attempt.correct_words = None
-            attempt.total_words = None
-            attempt.duration_seconds = None
-            old_sentences = await db.execute(
-                select(DictationSentence).where(DictationSentence.attempt_id == attempt.id)
-            )
-            for s in old_sentences.scalars().all():
-                await db.delete(s)
-            await db.commit()
-            await db.refresh(attempt)
-            return _session_payload(attempt, resumed=False, sentence_results=[])
-
-        # Same mode — resume where the user left off
-        sentence_results = await db.execute(
-            select(DictationSentence)
-            .where(DictationSentence.attempt_id == attempt.id)
-            .order_by(DictationSentence.sentence_index)
-        )
-        sentences = sentence_results.scalars().all()
-        return _session_payload(
-            attempt,
-            resumed=True,
-            sentence_results=[
-                {
-                    "sentence_index": s.sentence_index,
-                    "score": s.score,
-                    "word_diff": s.word_diff,
-                }
-                for s in sentences
-            ],
-        )
-
-    if attempt and attempt.status == "completed":
-        # Re-practice — reset the existing row, including the mode
-        attempt.status = "in_progress"
-        attempt.score = None
-        attempt.current_sentence_index = 0
-        attempt.total_sentences = total_sentences
-        attempt.practice_mode = practice_mode
-        attempt.error_summary = None
-        attempt.completed_at = None
-        attempt.correct_words = None
-        attempt.total_words = None
-        attempt.duration_seconds = None
-        old_sentences = await db.execute(
-            select(DictationSentence).where(DictationSentence.attempt_id == attempt.id)
-        )
-        for s in old_sentences.scalars().all():
-            await db.delete(s)
-        await db.commit()
-        await db.refresh(attempt)
-        return _session_payload(attempt, resumed=False, sentence_results=[])
-
-    # First time — create new row
-    attempt = DictationAttempt(
-        user_id=current_user.id,
-        video_id=video_id,
-        status="in_progress",
-        total_sentences=total_sentences,
-        practice_mode=practice_mode,
-    )
-    db.add(attempt)
-    await db.commit()
-    await db.refresh(attempt)
-    return _session_payload(attempt, resumed=False, sentence_results=[])
+    return await service.create_session(current_user, video_id, practice_mode)
 
 
 @router.post("/sessions/{session_id}/submit", response_model=SentenceResultResponse)
@@ -249,179 +57,19 @@ async def submit_answer(
     session_id: str,
     body: SubmitAnswerRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
-    # Get attempt
-    result = await db.execute(
-        select(DictationAttempt).where(
-            DictationAttempt.id == session_id,
-            DictationAttempt.user_id == current_user.id,
-        )
-    )
-    attempt = result.scalar_one_or_none()
-    if not attempt:
-        raise NotFoundError("Session not found")
-
-    # Get correct transcript segment by position (resilient to index gaps)
-    result = await db.execute(
-        select(Transcript)
-        .where(Transcript.video_id == attempt.video_id)
-        .order_by(Transcript.index)
-        .offset(body.sentence_index)
-        .limit(1)
-    )
-    transcript = result.scalar_one_or_none()
-    if not transcript:
-        raise NotFoundError("Transcript segment not found")
-
-    # Handle skipped sentences — mark all correct words as "missing" so the
-    # frontend can display the answer when the user revisits this sentence.
-    if body.skipped:
-        correct_words = transcript.text.strip().split()
-        diffs = [WordDiffItem(word=w, status="missing") for w in correct_words]
-        final_score = 0.0
-    else:
-        diffs, score = compute_word_diff(body.user_input, transcript.text)
-        hint_penalty = body.hints_used * 0.05
-        final_score = max(0, score - hint_penalty)
-
-    # Upsert sentence result (update if same sentence submitted again)
-    existing_sentence = (
-        await db.execute(
-            select(DictationSentence).where(
-                DictationSentence.attempt_id == session_id,
-                DictationSentence.sentence_index == body.sentence_index,
-            )
-        )
-    ).scalar_one_or_none()
-
-    if existing_sentence:
-        existing_sentence.user_input = body.user_input
-        existing_sentence.original_text = transcript.text
-        existing_sentence.score = final_score
-        existing_sentence.word_diff = [d.model_dump() for d in diffs]
-        existing_sentence.hints_used = body.hints_used
-        existing_sentence.replay_count = body.replay_count
-    else:
-        db.add(
-            DictationSentence(
-                attempt_id=session_id,
-                sentence_index=body.sentence_index,
-                user_input=body.user_input,
-                original_text=transcript.text,
-                score=final_score,
-                word_diff=[d.model_dump() for d in diffs],
-                hints_used=body.hints_used,
-                replay_count=body.replay_count,
-            )
-        )
-
-    # Advance progress — only move forward, never backwards
-    new_index = body.sentence_index + 1
-    if new_index > attempt.current_sentence_index:
-        attempt.current_sentence_index = new_index
-
-    # Auto-complete when all sentences are done
-    if attempt.total_sentences and attempt.current_sentence_index >= attempt.total_sentences:
-        from datetime import datetime
-
-        # Compute overall score from all sentence results
-        all_sentences = (
-            (
-                await db.execute(
-                    select(DictationSentence).where(DictationSentence.attempt_id == session_id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        scores = [s.score for s in all_sentences if s.score is not None]
-        attempt.score = sum(scores) / len(scores) if scores else 0.0
-        attempt.status = "completed"
-        attempt.completed_at = datetime.now(UTC)
-        _populate_analytics(attempt, list(all_sentences))
-
-    await db.commit()
-
-    if body.skipped:
-        difficulty_map = get_word_difficulty_map(transcript.text, language=transcript.language)
-        return SentenceResultResponse(
-            sentence_index=body.sentence_index,
-            score=0.0,
-            word_diffs=diffs,
-            correct_count=0,
-            wrong_count=0,
-            missing_count=len(diffs),
-            is_skipped=True,
-            original_text=transcript.text,
-            video_id=attempt.video_id,
-            audio_start_time=transcript.start_time,
-            word_difficulty=difficulty_map,
-        )
-
-    correct = sum(1 for d in diffs if d.status == "correct")
-    wrong = sum(1 for d in diffs if d.status == "wrong")
-    missing = sum(1 for d in diffs if d.status == "missing")
-    difficulty_map = get_word_difficulty_map(transcript.text, language=transcript.language)
-
-    return SentenceResultResponse(
-        sentence_index=body.sentence_index,
-        score=final_score,
-        word_diffs=diffs,
-        correct_count=correct,
-        wrong_count=wrong,
-        missing_count=missing,
-        original_text=transcript.text,
-        video_id=attempt.video_id,
-        audio_start_time=transcript.start_time,
-        word_difficulty=difficulty_map,
-    )
+    return await service.submit_answer(current_user, session_id, body)
 
 
 @router.post("/sessions/{session_id}/complete")
 async def complete_session(
     session_id: str,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
     """Explicitly mark a session as completed. Idempotent safety net."""
-    from datetime import datetime
-
-    result = await db.execute(
-        select(DictationAttempt).where(
-            DictationAttempt.id == session_id,
-            DictationAttempt.user_id == current_user.id,
-        )
-    )
-    attempt = result.scalar_one_or_none()
-    if not attempt:
-        raise NotFoundError("Session not found")
-
-    if attempt.status == "completed":
-        return {"status": "completed", "score": round((attempt.score or 0) * 100, 1)}
-
-    # Compute overall score from all sentence results
-    all_sentences = (
-        (
-            await db.execute(
-                select(DictationSentence).where(DictationSentence.attempt_id == session_id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    scores = [s.score for s in all_sentences if s.score is not None]
-    attempt.score = sum(scores) / len(scores) if scores else 0.0
-    attempt.status = "completed"
-    attempt.completed_at = datetime.now(UTC)
-    attempt.current_sentence_index = attempt.total_sentences or len(all_sentences)
-    _populate_analytics(attempt, list(all_sentences))
-    await db.commit()
-
-    return {"status": "completed", "score": round(attempt.score * 100, 1)}
-
-
-PAGE_SIZE = 20
+    return await service.complete_session(current_user, session_id)
 
 
 @router.get("/attempts/{status}", response_model=HistoryPaginatedResponse)
@@ -433,77 +81,10 @@ async def get_history(
     from_date: str | None = Query(None, description="ISO date, e.g. 2026-01-01"),
     to_date: str | None = Query(None, description="ISO date, e.g. 2026-12-31"),
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
-    # Map URL slug to DB value (in-progress → in_progress)
-    db_status = status.value.replace("-", "_")
-
-    # Base filter
-    base_filter = [
-        DictationAttempt.user_id == current_user.id,
-        DictationAttempt.status == db_status,
-    ]
-
-    if video_id:
-        base_filter.append(DictationAttempt.video_id == video_id)
-    if practice_mode:
-        base_filter.append(DictationAttempt.practice_mode == practice_mode)
-    if from_date:
-        from datetime import datetime as _dt
-
-        base_filter.append(DictationAttempt.created_at >= _dt.fromisoformat(from_date))
-    if to_date:
-        from datetime import datetime as _dt
-
-        base_filter.append(DictationAttempt.created_at <= _dt.fromisoformat(to_date + "T23:59:59"))
-
-    # Count total
-    count_q = select(sa_func.count()).select_from(DictationAttempt).where(*base_filter)
-    total = (await db.execute(count_q)).scalar() or 0
-    total_pages = max(1, math.ceil(total / PAGE_SIZE))
-
-    # Order depends on status
-    if status == AttemptStatus.completed:
-        order_col = DictationAttempt.completed_at.desc()
-    else:
-        order_col = DictationAttempt.updated_at.desc()
-
-    # Query with join to Video
-    query = (
-        select(DictationAttempt, Video.title, Video.thumbnail_url)
-        .join(Video, DictationAttempt.video_id == Video.id)
-        .where(*base_filter)
-        .order_by(order_col)
-        .offset((page - 1) * PAGE_SIZE)
-        .limit(PAGE_SIZE)
-    )
-    rows = (await db.execute(query)).all()
-
-    items = []
-    for attempt, video_title, video_thumbnail in rows:
-        progress_str = f"{attempt.current_sentence_index}/{attempt.total_sentences or 0}"
-        items.append(
-            HistoryAttemptResponse(
-                attempt_id=attempt.id,
-                video_id=attempt.video_id,
-                status=attempt.status,
-                score=attempt.score,
-                progress_str=progress_str,
-                video_title=video_title,
-                video_thumbnail=video_thumbnail or "",
-                practice_mode=attempt.practice_mode or "sentence",
-                duration_seconds=attempt.duration_seconds,
-                error_summary=attempt.error_summary,
-                updated_at=attempt.updated_at.isoformat(),
-                completed_at=attempt.completed_at.isoformat() if attempt.completed_at else None,
-            )
-        )
-
-    return HistoryPaginatedResponse(
-        items=items,
-        total=total,
-        page=page,
-        total_pages=total_pages,
+    return await service.get_history(
+        current_user, status.value, page, video_id, practice_mode, from_date, to_date
     )
 
 
@@ -514,88 +95,22 @@ async def get_attempts_summary(
     from_date: str | None = Query(None),
     to_date: str | None = Query(None),
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
     """Aggregate stats for the history page: total sessions, total time, avg score."""
-    base_filter = [
-        DictationAttempt.user_id == current_user.id,
-        DictationAttempt.status == "completed",
-    ]
-    if video_id:
-        base_filter.append(DictationAttempt.video_id == video_id)
-    if practice_mode:
-        base_filter.append(DictationAttempt.practice_mode == practice_mode)
-    if from_date:
-        from datetime import datetime as _dt
-
-        base_filter.append(DictationAttempt.created_at >= _dt.fromisoformat(from_date))
-    if to_date:
-        from datetime import datetime as _dt
-
-        base_filter.append(DictationAttempt.created_at <= _dt.fromisoformat(to_date + "T23:59:59"))
-
-    result = await db.execute(
-        select(
-            sa_func.count(),
-            sa_func.coalesce(sa_func.sum(DictationAttempt.duration_seconds), 0),
-            sa_func.coalesce(sa_func.avg(DictationAttempt.score), 0),
-        ).where(*base_filter)
+    return await service.get_attempts_summary(
+        current_user, video_id, practice_mode, from_date, to_date
     )
-    row = result.one()
-    return {
-        "total_sessions": row[0],
-        "total_duration_seconds": row[1],
-        "average_score": round(float(row[2]) * 100, 1),
-    }
-
-
-# ─── Cloze (paragraph fill-in-the-blanks) ─────────────────────────────────────
-
-
-async def _load_attempt(
-    session_id: str,
-    user_id: str,
-    db: AsyncSession,
-) -> DictationAttempt:
-    attempt = (
-        await db.execute(
-            select(DictationAttempt).where(
-                DictationAttempt.id == session_id,
-                DictationAttempt.user_id == user_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if not attempt:
-        raise NotFoundError("Session not found")
-    return attempt
-
-
-async def _load_transcripts(video_id: str, db: AsyncSession) -> list[Transcript]:
-    rows = (
-        (
-            await db.execute(
-                select(Transcript).where(Transcript.video_id == video_id).order_by(Transcript.index)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    if not rows:
-        raise NotFoundError("No transcripts found for this video")
-    return list(rows)
 
 
 @router.get("/sessions/{session_id}/cloze", response_model=ClozeChunksResponse)
 async def get_cloze_chunks(
     session_id: str,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
     """Build paragraph chunks with blanks for cloze-mode practice."""
-    attempt = await _load_attempt(session_id, current_user.id, db)
-    transcripts = await _load_transcripts(attempt.video_id, db)
-    chunks = build_chunks(transcripts)
-    return ClozeChunksResponse(practice_mode="cloze", chunks=chunks)
+    return await service.get_cloze_chunks(current_user, session_id)
 
 
 @router.post("/sessions/{session_id}/cloze-submit", response_model=ClozeResultResponse)
@@ -603,112 +118,10 @@ async def submit_cloze(
     session_id: str,
     body: ClozeSubmitRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
     """Score a chunk's blanks (case-insensitive, trimmed) and persist progress."""
-    attempt = await _load_attempt(session_id, current_user.id, db)
-    transcripts = await _load_transcripts(attempt.video_id, db)
-    chunks = build_chunks(transcripts)
-
-    if body.chunk_index < 0 or body.chunk_index >= len(chunks):
-        raise BadRequestError("chunk_index out of range")
-
-    chunk = chunks[body.chunk_index]
-    expected = get_chunk_answers(chunk)
-
-    # Pad/truncate user's answers to the expected length so we always score
-    # against the same number of blanks the server believes exist.
-    given = list(body.answers) + [""] * max(0, len(expected) - len(body.answers))
-    given = given[: len(expected)]
-
-    results: list[ClozeBlankResult] = []
-    correct_count = 0
-    for i, (exp, got) in enumerate(zip(expected, given)):
-        is_correct = exp.strip().lower() == got.strip().lower() and got.strip() != ""
-        if is_correct:
-            correct_count += 1
-        results.append(
-            ClozeBlankResult(
-                blank_index=i,
-                given=got,
-                expected=exp,
-                status="correct" if is_correct else "wrong",
-            )
-        )
-
-    score = correct_count / len(expected) if expected else 1.0
-
-    # Persist as a DictationSentence row keyed by chunk_index. Reuses the existing
-    # aggregation pipeline (avg score, streak counting) without further changes.
-    existing = (
-        await db.execute(
-            select(DictationSentence).where(
-                DictationSentence.attempt_id == session_id,
-                DictationSentence.sentence_index == body.chunk_index,
-            )
-        )
-    ).scalar_one_or_none()
-
-    word_diff_payload = [r.model_dump() for r in results]
-    user_input_joined = " ".join(given).strip()
-
-    if existing:
-        existing.user_input = user_input_joined
-        existing.original_text = " ".join(expected)
-        existing.score = score
-        existing.word_diff = word_diff_payload
-    else:
-        db.add(
-            DictationSentence(
-                attempt_id=session_id,
-                sentence_index=body.chunk_index,
-                user_input=user_input_joined,
-                original_text=" ".join(expected),
-                score=score,
-                word_diff=word_diff_payload,
-            )
-        )
-
-    new_index = body.chunk_index + 1
-    if new_index > attempt.current_sentence_index:
-        attempt.current_sentence_index = new_index
-
-    # Cloze treats total_sentences as total chunks for completion tracking
-    if attempt.total_sentences != len(chunks):
-        attempt.total_sentences = len(chunks)
-
-    if attempt.current_sentence_index >= len(chunks):
-        from datetime import datetime
-
-        all_sentences = (
-            (
-                await db.execute(
-                    select(DictationSentence).where(DictationSentence.attempt_id == session_id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        scores = [s.score for s in all_sentences if s.score is not None]
-        attempt.score = sum(scores) / len(scores) if scores else 0.0
-        attempt.status = "completed"
-        attempt.completed_at = datetime.now(UTC)
-        _populate_analytics(attempt, list(all_sentences))
-
-    await db.commit()
-
-    return ClozeResultResponse(
-        chunk_index=body.chunk_index,
-        score=score,
-        correct_count=correct_count,
-        total_count=len(expected),
-        results=results,
-        audio_start_time=chunk.start_time,
-        audio_end_time=chunk.end_time,
-    )
-
-
-# ─── Full-transcript cloze (new) ─────────────────────────────────────────────
+    return await service.submit_cloze(current_user, session_id, body)
 
 
 @router.get("/sessions/{session_id}/cloze-full", response_model=ClozeFullResponse)
@@ -716,18 +129,10 @@ async def get_cloze_full(
     session_id: str,
     difficulty: str = Query("medium"),
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
     """Build the full-transcript cloze view with difficulty-based blank selection."""
-    attempt = await _load_attempt(session_id, current_user.id, db)
-    transcripts = await _load_transcripts(attempt.video_id, db)
-    segments, total_blanks = build_full_cloze(transcripts, difficulty)
-    return ClozeFullResponse(
-        practice_mode="cloze",
-        difficulty=difficulty,
-        total_blanks=total_blanks,
-        segments=segments,
-    )
+    return await service.get_cloze_full(current_user, session_id, difficulty)
 
 
 @router.post("/sessions/{session_id}/cloze-submit-all", response_model=ClozeSubmitAllResponse)
@@ -735,138 +140,10 @@ async def submit_cloze_all(
     session_id: str,
     body: ClozeSubmitAllRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
     """Score ALL blanks at once and mark the session completed."""
-    from datetime import datetime
-
-    attempt = await _load_attempt(session_id, current_user.id, db)
-    transcripts = await _load_transcripts(attempt.video_id, db)
-    segments, total_blanks = build_full_cloze(transcripts, body.difficulty)
-    expected = get_full_cloze_answers(segments)
-
-    given = list(body.answers) + [""] * max(0, len(expected) - len(body.answers))
-    given = given[: len(expected)]
-
-    results: list[ClozeBlankResult] = []
-    correct_count = 0
-    for i, (exp, got) in enumerate(zip(expected, given)):
-        is_correct = exp.strip().lower() == got.strip().lower() and got.strip() != ""
-        if is_correct:
-            correct_count += 1
-        results.append(
-            ClozeBlankResult(
-                blank_index=i,
-                given=got,
-                expected=exp,
-                status="correct" if is_correct else "wrong",
-            )
-        )
-
-    score = correct_count / len(expected) if expected else 1.0
-
-    blank_to_result: dict[int, ClozeBlankResult] = {r.blank_index: r for r in results}
-    segment_scores: list[SegmentScore] = []
-    for seg in segments:
-        seg_results = [
-            blank_to_result[tok.blank_index]
-            for tok in seg.tokens
-            if tok.is_blank and tok.blank_index is not None and tok.blank_index in blank_to_result
-        ]
-        seg_correct = sum(1 for r in seg_results if r.status == "correct")
-        seg_score = seg_correct / len(seg_results) if seg_results else 1.0
-        segment_scores.append(
-            SegmentScore(
-                segment_index=seg.segment_index,
-                start_time=seg.start_time,
-                end_time=seg.end_time,
-                score=seg_score,
-                blank_results=seg_results,
-            )
-        )
-
-    attempt.score = score
-    attempt.status = "completed"
-    attempt.completed_at = datetime.now(UTC)
-    attempt.current_sentence_index = attempt.total_sentences or 0
-
-    cloze_sentences = (
-        (
-            await db.execute(
-                select(DictationSentence).where(DictationSentence.attempt_id == session_id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    _populate_analytics(attempt, list(cloze_sentences))
-    await db.commit()
-
-    return ClozeSubmitAllResponse(
-        score=score,
-        correct_count=correct_count,
-        total_count=len(expected),
-        results=results,
-        segment_scores=segment_scores,
-    )
-
-
-# ─── Sentence Reorder ────────────────────────────────────────────────────────
-
-_PUNCT_RE = re.compile(r"""^[.,!?;:'"()\[\]{}\-—–…]+$""")
-
-
-def _tokenize_for_reorder(text: str) -> list[str]:
-    """Split text into tokens, attaching trailing punctuation to the preceding word.
-
-    "Hello, world!" → ["Hello,", "world!"]
-    This keeps punctuation with its word so the user drags meaningful units.
-    """
-    raw = text.strip().split()
-    merged: list[str] = []
-    for tok in raw:
-        if merged and _PUNCT_RE.match(tok):
-            merged[-1] += tok
-        else:
-            merged.append(tok)
-    return merged
-
-
-def _shuffle_tokens(tokens: list[str]) -> list[str]:
-    """Return a shuffled copy that is guaranteed to differ from the original
-    (when there are ≥2 distinct tokens)."""
-    shuffled = tokens[:]
-    distinct = len(set(tokens))
-    if distinct < 2:
-        return shuffled
-    for _ in range(20):
-        random.shuffle(shuffled)
-        if shuffled != tokens:
-            return shuffled
-    return shuffled
-
-
-def _score_reorder(
-    submitted: list[str], expected: list[str]
-) -> tuple[float, list[ReorderTokenResult]]:
-    """Score by comparing token positions. Returns (score, per-token results)."""
-    results: list[ReorderTokenResult] = []
-    correct = 0
-    for i, exp in enumerate(expected):
-        got = submitted[i] if i < len(submitted) else ""
-        is_correct = got.strip().lower() == exp.strip().lower()
-        if is_correct:
-            correct += 1
-        results.append(
-            ReorderTokenResult(
-                index=i,
-                token=got,
-                expected=exp,
-                is_correct=is_correct,
-            )
-        )
-    score = correct / len(expected) if expected else 1.0
-    return score, results
+    return await service.submit_cloze_all(current_user, session_id, body)
 
 
 @router.get(
@@ -876,34 +153,10 @@ def _score_reorder(
 async def get_reorder_challenges(
     session_id: str,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
     """Return shuffled tokens for each transcript sentence in the session."""
-    attempt = await _load_attempt(session_id, current_user.id, db)
-    stored_transcripts = await _load_transcripts(attempt.video_id, db)
-    segments = _segments_for_practice_mode(stored_transcripts, "reorder")
-    if attempt.total_sentences != len(segments):
-        attempt.total_sentences = len(segments)
-        await db.commit()
-
-    challenges: list[ReorderChallenge] = []
-    for idx, segment in enumerate(segments):
-        tokens = _tokenize_for_reorder(segment.text)
-        shuffled = _shuffle_tokens(tokens)
-        challenges.append(
-            ReorderChallenge(
-                sentence_index=idx,
-                start_time=segment.start,
-                end_time=segment.end,
-                shuffled_tokens=[ReorderToken(index=i, text=s) for i, s in enumerate(shuffled)],
-                token_count=len(tokens),
-            )
-        )
-
-    return ReorderChallengesResponse(
-        total_sentences=len(challenges),
-        challenges=challenges,
-    )
+    return await service.get_reorder_challenges(current_user, session_id)
 
 
 @router.post(
@@ -914,81 +167,10 @@ async def submit_reorder(
     session_id: str,
     body: ReorderSubmitRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
     """Score a single reordered sentence and persist progress."""
-    attempt = await _load_attempt(session_id, current_user.id, db)
-    stored_transcripts = await _load_transcripts(attempt.video_id, db)
-    segments = _segments_for_practice_mode(stored_transcripts, "reorder")
-    if attempt.total_sentences != len(segments):
-        attempt.total_sentences = len(segments)
-
-    if body.sentence_index < 0 or body.sentence_index >= len(segments):
-        raise BadRequestError("sentence_index out of range")
-
-    segment = segments[body.sentence_index]
-    expected_tokens = _tokenize_for_reorder(segment.text)
-    score, token_results = _score_reorder(body.ordered_tokens, expected_tokens)
-
-    word_diff_payload = [r.model_dump() for r in token_results]
-    user_input_joined = " ".join(body.ordered_tokens)
-
-    existing = (
-        await db.execute(
-            select(DictationSentence).where(
-                DictationSentence.attempt_id == session_id,
-                DictationSentence.sentence_index == body.sentence_index,
-            )
-        )
-    ).scalar_one_or_none()
-
-    if existing:
-        existing.user_input = user_input_joined
-        existing.original_text = segment.text
-        existing.score = score
-        existing.word_diff = word_diff_payload
-    else:
-        db.add(
-            DictationSentence(
-                attempt_id=session_id,
-                sentence_index=body.sentence_index,
-                user_input=user_input_joined,
-                original_text=segment.text,
-                score=score,
-                word_diff=word_diff_payload,
-            )
-        )
-
-    new_index = body.sentence_index + 1
-    if new_index > attempt.current_sentence_index:
-        attempt.current_sentence_index = new_index
-
-    if attempt.total_sentences and attempt.current_sentence_index >= attempt.total_sentences:
-        all_sentences = (
-            (
-                await db.execute(
-                    select(DictationSentence).where(DictationSentence.attempt_id == session_id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        scores = [s.score for s in all_sentences if s.score is not None]
-        attempt.score = sum(scores) / len(scores) if scores else 0.0
-        attempt.status = "completed"
-        attempt.completed_at = datetime.now(UTC)
-        _populate_analytics(attempt, list(all_sentences))
-
-    await db.commit()
-
-    return ReorderSentenceResult(
-        sentence_index=body.sentence_index,
-        score=score,
-        token_results=token_results,
-        correct_order=expected_tokens,
-        start_time=segment.start,
-        end_time=segment.end,
-    )
+    return await service.submit_reorder(current_user, session_id, body)
 
 
 @router.post(
@@ -999,90 +181,7 @@ async def submit_reorder_all(
     session_id: str,
     body: ReorderSubmitAllRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    service: DictationService = Depends(get_dictation_service),
 ):
     """Score ALL reordered sentences at once and mark session completed."""
-    attempt = await _load_attempt(session_id, current_user.id, db)
-    stored_transcripts = await _load_transcripts(attempt.video_id, db)
-    segments = _segments_for_practice_mode(stored_transcripts, "reorder")
-    if attempt.total_sentences != len(segments):
-        attempt.total_sentences = len(segments)
-
-    sentence_results: list[ReorderSentenceResult] = []
-    total_correct = 0
-    total_tokens = 0
-
-    for idx, segment in enumerate(segments):
-        expected_tokens = _tokenize_for_reorder(segment.text)
-        submitted = body.answers[idx] if idx < len(body.answers) else []
-        score, token_results = _score_reorder(submitted, expected_tokens)
-
-        correct_in_sentence = sum(1 for r in token_results if r.is_correct)
-        total_correct += correct_in_sentence
-        total_tokens += len(expected_tokens)
-
-        word_diff_payload = [r.model_dump() for r in token_results]
-        user_input_joined = " ".join(submitted)
-
-        existing = (
-            await db.execute(
-                select(DictationSentence).where(
-                    DictationSentence.attempt_id == session_id,
-                    DictationSentence.sentence_index == idx,
-                )
-            )
-        ).scalar_one_or_none()
-
-        if existing:
-            existing.user_input = user_input_joined
-            existing.original_text = segment.text
-            existing.score = score
-            existing.word_diff = word_diff_payload
-        else:
-            db.add(
-                DictationSentence(
-                    attempt_id=session_id,
-                    sentence_index=idx,
-                    user_input=user_input_joined,
-                    original_text=segment.text,
-                    score=score,
-                    word_diff=word_diff_payload,
-                )
-            )
-
-        sentence_results.append(
-            ReorderSentenceResult(
-                sentence_index=idx,
-                score=score,
-                token_results=token_results,
-                correct_order=expected_tokens,
-                start_time=segment.start,
-                end_time=segment.end,
-            )
-        )
-
-    overall_score = total_correct / total_tokens if total_tokens else 1.0
-
-    attempt.score = overall_score
-    attempt.status = "completed"
-    attempt.completed_at = datetime.now(UTC)
-    attempt.current_sentence_index = len(segments)
-
-    all_sentences = (
-        (
-            await db.execute(
-                select(DictationSentence).where(DictationSentence.attempt_id == session_id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    _populate_analytics(attempt, list(all_sentences))
-    await db.commit()
-
-    return ReorderSubmitAllResponse(
-        score=overall_score,
-        correct_count=total_correct,
-        total_count=total_tokens,
-        sentence_results=sentence_results,
-    )
+    return await service.submit_reorder_all(current_user, session_id, body)

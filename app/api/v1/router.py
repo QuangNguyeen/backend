@@ -2,12 +2,12 @@ from fastapi import APIRouter
 
 from app.api.v1.admin.router import router as admin_router
 from app.api.v1.auth import router as auth_router
-from app.api.v1.events import router as events_router
 from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.dictation import router as dictation_router
 from app.api.v1.dictionary import router as dictionary_router
-from app.api.v1.quiz import router as quiz_router
+from app.api.v1.events import router as events_router
 from app.api.v1.rooms import router as rooms_router
+from app.api.v1.topic_tags import router as topic_tags_router
 from app.api.v1.users import router as users_router
 from app.api.v1.videos import router as videos_router
 from app.api.v1.vocabulary import router as vocabulary_router
@@ -20,7 +20,7 @@ api_router.include_router(dictation_router)
 api_router.include_router(dashboard_router)
 api_router.include_router(vocabulary_router)
 api_router.include_router(dictionary_router)
-api_router.include_router(quiz_router)
 api_router.include_router(rooms_router)
+api_router.include_router(topic_tags_router)
 api_router.include_router(admin_router)
 api_router.include_router(events_router)

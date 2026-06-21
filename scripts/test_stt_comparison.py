@@ -1,4 +1,4 @@
-"""Compare STT accuracy: Gemini vs AssemblyAI vs Google Cloud STT.
+"""Compare STT accuracy: Gemini vs AssemblyAI.
 
 Downloads audio once, sends to both services, and prints side-by-side
 segment + timestamp results for manual accuracy evaluation.
@@ -8,11 +8,11 @@ Usage:
 """
 
 import json
-import os
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import wave
 from pathlib import Path
 
@@ -22,7 +22,7 @@ YOUTUBE_ID = "4yD_pY8yhB8"
 ASSEMBLYAI_API_KEY = "8052f365120b485bab2ee70759843db6"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from app.config import get_settings
+from app.config import get_settings  # noqa: E402
 
 settings = get_settings()
 GEMINI_API_KEY = settings.GEMINI_API_KEY
@@ -109,7 +109,7 @@ Rules for sentences:
 - Never merge two independent clauses into one sentence
 - If a passage repeats (e.g. dictation exercise), include both occurrences"""
 
-    print(f"[Gemini] Requesting transcription from gemini-2.5-flash...")
+    print("[Gemini] Requesting transcription from gemini-2.5-flash...")
     t0 = time.time()
     try:
         response = client.models.generate_content(
@@ -180,10 +180,18 @@ def _map_sentences_to_words(sentences: list[str], words: list[dict]) -> list[dic
         last_matched_idx = word_idx
         max_scan = len(sent_words) * 3
 
-        while word_idx < len(words) and matched < len(sent_words) and (word_idx - start_idx) < max_scan:
+        while (
+            word_idx < len(words)
+            and matched < len(sent_words)
+            and (word_idx - start_idx) < max_scan
+        ):
             stt_norm = _normalize(words[word_idx]["word"])
             sent_norm = sent_words[matched]
-            if stt_norm == sent_norm or stt_norm.startswith(sent_norm) or sent_norm.startswith(stt_norm):
+            if (
+                stt_norm == sent_norm
+                or stt_norm.startswith(sent_norm)
+                or sent_norm.startswith(stt_norm)
+            ):
                 matched += 1
                 last_matched_idx = word_idx
             word_idx += 1
@@ -224,7 +232,7 @@ def run_assemblyai_stt(wav_path: Path, language: str = "en") -> list[dict]:
 
     aai.settings.api_key = ASSEMBLYAI_API_KEY
 
-    print(f"[AssemblyAI] Uploading and transcribing...")
+    print("[AssemblyAI] Uploading and transcribing...")
     t0 = time.time()
 
     config = aai.TranscriptionConfig(
@@ -270,80 +278,6 @@ def run_assemblyai_stt(wav_path: Path, language: str = "en") -> list[dict]:
     return segments, word_data
 
 
-# ─── Google Cloud STT ─────────────────────────────────────────────────────────
-
-def run_google_cloud_stt(wav_path: Path, language: str = "en-US") -> tuple[list[dict], list[dict]]:
-    creds_raw = settings.GOOGLE_APPLICATION_CREDENTIALS
-    if not creds_raw:
-        print("[Google-STT] GOOGLE_APPLICATION_CREDENTIALS not set, skipping")
-        return [], []
-
-    project_root = Path(__file__).resolve().parent.parent
-    creds_path = creds_raw if os.path.isabs(creds_raw) else str(project_root / creds_raw)
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
-
-    from google.cloud import speech, storage
-
-    bucket_name = settings.GCS_BUCKET_NAME
-    if not bucket_name:
-        print("[Google-STT] GCS_BUCKET_NAME not set, skipping")
-        return [], []
-
-    # Upload to GCS for long_running_recognize
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-    blob_name = f"audio-ytb/test-stt/{wav_path.name}"
-    blob = bucket.blob(blob_name)
-
-    print(f"[Google-STT] Uploading to gs://{bucket_name}/{blob_name}...")
-    blob.upload_from_filename(str(wav_path))
-    gcs_uri = f"gs://{bucket_name}/{blob_name}"
-
-    speech_client = speech.SpeechClient()
-    audio = speech.RecognitionAudio(uri=gcs_uri)
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=16000,
-        language_code=language,
-        enable_automatic_punctuation=True,
-        enable_word_time_offsets=True,
-        audio_channel_count=1,
-        model="latest_long",
-        use_enhanced=True,
-    )
-
-    print(f"[Google-STT] Running long_running_recognize...")
-    t0 = time.time()
-    operation = speech_client.long_running_recognize(config=config, audio=audio)
-    response = operation.result(timeout=600)
-    elapsed = time.time() - t0
-    print(f"[Google-STT] Response in {elapsed:.1f}s, {len(response.results)} results")
-
-    words = []
-    for result in response.results:
-        alt = result.alternatives[0]
-        for w in alt.words:
-            words.append({
-                "word": w.word,
-                "start": w.start_time.total_seconds(),
-                "end": w.end_time.total_seconds(),
-            })
-
-    import re
-    punctuated_parts = []
-    for result in response.results:
-        alt = result.alternatives[0]
-        if alt.transcript:
-            punctuated_parts.append(alt.transcript.strip())
-    punctuated_text = " ".join(punctuated_parts)
-
-    sentences_raw = re.split(r'(?<=[.?!])\s+', punctuated_text.strip())
-    sentences_raw = [s.strip() for s in sentences_raw if s.strip()]
-
-    segments = _map_sentences_to_words(sentences_raw, words)
-    return segments, words
-
-
 # ─── Display ──────────────────────────────────────────────────────────────────
 
 def print_segments(label: str, segments: list[dict]):
@@ -369,7 +303,7 @@ def print_words(label: str, words: list[dict], max_show: int = 50):
 
 def compare_summary(results: dict):
     print(f"\n{'#' * 80}")
-    print(f"  COMPARISON SUMMARY")
+    print("  COMPARISON SUMMARY")
     print(f"{'#' * 80}")
 
     for name, data in results.items():
@@ -437,7 +371,7 @@ def main():
             }
         except Exception as e:
             print(f"[Gemini] FAILED: {e}")
-            import traceback; traceback.print_exc()
+            traceback.print_exc()
 
         # ── AssemblyAI STT ──
         print(f"\n{'━' * 80}")
@@ -460,33 +394,7 @@ def main():
             }
         except Exception as e:
             print(f"[AssemblyAI] FAILED: {e}")
-            import traceback; traceback.print_exc()
-
-        # ── Google Cloud STT ──
-        print(f"\n{'━' * 80}")
-        print("  TEST 3: Google Cloud STT")
-        print(f"{'━' * 80}")
-        try:
-            t0 = time.time()
-            gcs_result = run_google_cloud_stt(wav_path, "en-US")
-            gcs_elapsed = time.time() - t0
-            if isinstance(gcs_result, tuple):
-                gcs_segments, gcs_words = gcs_result
-            else:
-                gcs_segments, gcs_words = gcs_result, []
-            if gcs_segments:
-                print_segments("Google Cloud STT", gcs_segments)
-                print_words("Google Cloud STT", gcs_words)
-                results["Google Cloud STT"] = {
-                    "segments": gcs_segments,
-                    "words": gcs_words,
-                    "elapsed": gcs_elapsed,
-                }
-            else:
-                print("[Google-STT] No results (may need GCS for long audio)")
-        except Exception as e:
-            print(f"[Google-STT] FAILED: {e}")
-            import traceback; traceback.print_exc()
+            traceback.print_exc()
 
     compare_summary(results)
 

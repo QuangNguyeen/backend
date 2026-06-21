@@ -73,3 +73,10 @@ Thumbs.db
 
 # ─────────────── Project scratch ───────────────
 task.md
+
+# ─────────────── Duplicated source / thesis-defense copy ───────────────
+# Full project snapshot kept for review ("phản biện") — not part of the app.
+phan-bien/
+
+# ─────────────── Documentation (SRS / UML) — not needed for the app ───────────────
+docs/
