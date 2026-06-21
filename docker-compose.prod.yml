@@ -41,9 +41,9 @@ services:
       --loglevel=info --pool=prefork --concurrency=2 --max-tasks-per-child=20
     mem_limit: 4g
     volumes:
-      # Writable (no :ro) so yt-dlp can persist YouTube's rotated session
-      # cookies back to the file, keeping the login session alive longer.
-      - ./secrets/cookies.txt:/app/cookies.txt
+      # Read-only so the pipeline never writes rotated cookies back to the
+      # source — yt-dlp uses a throwaway /tmp copy (see _writable_cookie_file).
+      - ./secrets/cookies.txt:/app/cookies.txt:ro
       - ./secrets/gcp-credentials.json:/app/gcp-credentials.json:ro
     depends_on:
       db: { condition: service_healthy }
