@@ -36,8 +36,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/dictalearn-backend:latest
-            ghcr.io/${{ github.repository_owner }}/dictalearn-backend:${{ github.sha }}
+            ghcr.io/quangnguyeen/dictalearn-backend:latest
+            ghcr.io/quangnguyeen/dictalearn-backend:${{ github.sha }}
       - uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VPS_HOST }}
