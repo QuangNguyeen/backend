@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.services.youtube_service import TranscriptSegment
+from app.services.youtube_service import TranscriptSegment, _proxy_url
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,9 @@ def _yt_dlp_options(**overrides):
     cookie_file = _writable_cookie_file()
     if cookie_file:
         opts["cookiefile"] = cookie_file
+    proxy = _proxy_url()
+    if proxy:
+        opts["proxy"] = proxy
     opts.update(overrides)
     return opts
 
@@ -215,6 +218,9 @@ def extract_wav_audio(video_id: str, out_dir: Path) -> AudioFile:
     cookie_file = _writable_cookie_file()
     if cookie_file:
         cmd += ["--cookies", cookie_file]
+    proxy = _proxy_url()
+    if proxy:
+        cmd += ["--proxy", proxy]
     cmd.append(_youtube_url(video_id))
 
     logger.info("[STT] Extracting WAV fallback for %s -> %s", video_id, wav_path)

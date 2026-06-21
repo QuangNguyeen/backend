@@ -16,6 +16,7 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
 )
 
+from app.config import get_settings
 from app.core.exceptions import BadRequestError, NotFoundError
 
 logger = logging.getLogger(__name__)
@@ -24,12 +25,21 @@ logger = logging.getLogger(__name__)
 _cookie_path = Path(__file__).resolve().parent.parent.parent / "cookies.txt"
 
 
+def _proxy_url() -> str | None:
+    """Optional (residential) proxy for all YouTube traffic; None = disabled."""
+    return get_settings().YT_PROXY_URL or None
+
+
 def _create_api() -> YouTubeTranscriptApi:
-    if _cookie_path.exists():
+    proxy = _proxy_url()
+    if _cookie_path.exists() or proxy:
         session = requests.Session()
-        jar = MozillaCookieJar(str(_cookie_path))
-        jar.load(ignore_discard=True, ignore_expires=True)
-        session.cookies = jar
+        if _cookie_path.exists():
+            jar = MozillaCookieJar(str(_cookie_path))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            session.cookies = jar
+        if proxy:
+            session.proxies = {"http": proxy, "https": proxy}
         return YouTubeTranscriptApi(http_client=session)
     return YouTubeTranscriptApi()
 
@@ -271,6 +281,9 @@ def get_transcript_ytdlp(video_id: str, languages: list[str] | None = None) -> T
     cookie_file = _writable_cookie_file()
     if cookie_file:
         ydl_opts["cookiefile"] = cookie_file
+    proxy = _proxy_url()
+    if proxy:
+        ydl_opts["proxy"] = proxy
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)

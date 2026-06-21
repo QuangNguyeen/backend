@@ -40,6 +40,11 @@ class Settings(BaseSettings):
         "https://dictalearn-react.nvquang176.workers.dev",
     ]
 
+    # YouTube proxy — route youtube-transcript-api + yt-dlp through a (residential)
+    # proxy to bypass datacenter-IP blocks ("RequestBlocked" / "not a bot").
+    # Empty = disabled. Format: http://user:pass@host:port
+    YT_PROXY_URL: str = ""
+
     # Gemini
     GEMINI_API_KEY: str = ""
 
