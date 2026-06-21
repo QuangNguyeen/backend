@@ -1,4 +1,5 @@
 import logging
+import sys
 
 from celery import Celery
 from celery.signals import setup_logging
@@ -6,6 +7,11 @@ from celery.signals import setup_logging
 from app.config import get_settings
 
 settings = get_settings()
+
+# macOS aborts forked children that touch native libs (gRPC/Objective-C),
+# which the STT task pulls in via google.cloud. Use the non-forking "solo"
+# pool on macOS; keep "prefork" everywhere else for concurrency.
+_worker_pool = "solo" if sys.platform == "darwin" else "prefork"
 
 celery = Celery(
     "dictalearn",
@@ -22,7 +28,7 @@ celery.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     result_expires=3600,
-    worker_pool="prefork",
+    worker_pool=_worker_pool,
 )
 
 celery.conf.include = ["app.tasks.transcription", "app.tasks.vocabulary_enrichment"]

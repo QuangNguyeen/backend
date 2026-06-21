@@ -1,0 +1,74 @@
+# Low-memory override for a ~4 GB RAM VPS (e.g. 4 vCPU / 4 GB / 60 GB SSD).
+#
+# Layered on top of docker-compose.prod.yml — it trims worker counts, caps the
+# Postgres/Redis memory budgets, and drops the optional observability containers
+# so the whole stack fits comfortably under ~3 GB with headroom for spikes.
+#
+# Usage (note: BOTH -f files, base first, override second):
+#
+#   docker compose \
+#     -f docker-compose.prod.yml \
+#     -f docker-compose.prod.lowmem.yml \
+#     up -d
+#
+# The big RAM saver is fewer worker processes: spaCy (en_core_web_sm) is loaded
+# once per uvicorn worker AND per Celery child, so each process costs ~250 MB.
+#
+# Recommended companion step on the host (one-time, survives reboot):
+#   sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile \
+#     && sudo mkswap /swapfile && sudo swapon /swapfile \
+#     && echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+services:
+  web:
+    environment:
+      # 4 -> 2 uvicorn workers. Still parallel, ~half the spaCy footprint.
+      UVICORN_WORKERS: "2"
+    deploy:
+      resources:
+        limits:
+          memory: 900M
+
+  worker:
+    # 3 -> 2 Celery children.
+    command: >
+      celery -A app.celery_app.celery worker
+      --loglevel=info --pool=prefork --concurrency=2
+    deploy:
+      resources:
+        limits:
+          memory: 800M
+
+  db:
+    # shared_buffers 512MB -> 256MB, fewer connections to bound backend memory.
+    command: >
+      postgres -c max_connections=60 -c shared_buffers=256MB
+    deploy:
+      resources:
+        limits:
+          memory: 600M
+
+  redis:
+    # maxmemory 512mb -> 256mb (LRU eviction unchanged).
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --appendonly yes
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+
+  caddy:
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # Disable optional observability containers — nice-to-have, not core.
+  # Re-enable temporarily for debugging by running the base file without this
+  # override, or with `--scale dozzle=1 --scale uptime-kuma=1`.
+  dozzle:
+    deploy:
+      replicas: 0
+
+  uptime-kuma:
+    deploy:
+      replicas: 0

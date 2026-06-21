@@ -49,3 +49,8 @@ class UserUpdateRequest(BaseModel):
         if not stripped:
             raise ValueError("display_name cannot be blank")
         return stripped
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str

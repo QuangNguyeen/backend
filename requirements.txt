@@ -37,9 +37,8 @@ edge-tts>=6.1.0
 # Translation fallback
 deep-translator>=1.11.0
 
-# Google Cloud
-google-cloud-speech>=2.38.0
-google-cloud-storage>=3.10.0
+# Google Cloud Translation
+google-cloud-translate>=3.26.0
 
 # LLM
 google-genai>=1.0.0

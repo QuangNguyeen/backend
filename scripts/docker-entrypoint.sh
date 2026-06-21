@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# DictaLearn Backend - Docker Entrypoint (web container)
+# DictaLearn Backend - Docker Entrypoint (shared by web + worker).
+# Waits for the DB, optionally runs migrations, then execs the container command
+# if one was provided (e.g. the Celery worker), otherwise starts uvicorn.
 set -e
 
 echo "Starting DictaLearn Backend..."
@@ -40,6 +42,12 @@ PY
 if [ "${RUN_MIGRATIONS:-1}" = "1" ]; then
     echo "Running alembic upgrade head..."
     alembic upgrade head
+fi
+
+# If a command was given (e.g. the Celery worker), run it instead of uvicorn.
+if [ "$#" -gt 0 ]; then
+    echo "Starting: $*"
+    exec "$@"
 fi
 
 echo "Starting uvicorn server..."

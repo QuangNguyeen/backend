@@ -7,11 +7,11 @@ from sqlalchemy.orm import Session
 
 from app.celery_app import celery
 from app.config import get_settings
+from app.events import publish_video_event_sync
 from app.models.video import Transcript, Video
-
-# from app.services.google_stt_service import transcribe_with_gemini  # OLD: Gemini STT
 from app.services.assemblyai_service import transcribe_with_assemblyai
 from app.services.level_service import calculate_audio_difficulty, difficulty_update_values
+from app.services.stt_audio_service import VideoUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,9 @@ def run_stt_pipeline(
     language: str,
     video_duration: int,
     max_segment_duration: float = 10.0,
+    title: str | None = None,
+    channel: str | None = None,
+    prompt_context: str | None = None,
 ):
     """Run the AssemblyAI STT pipeline in a Celery worker.
 
@@ -63,7 +66,17 @@ def run_stt_pipeline(
     try:
         logger.info("[CELERY] Calling transcribe_with_assemblyai for %s...", youtube_id)
         stt_t0 = time.time()
-        stt_segments = transcribe_with_assemblyai(youtube_id, language, video_duration)
+        stt_segments = transcribe_with_assemblyai(
+            youtube_id,
+            language,
+            video_duration,
+            max_segment_duration=max_segment_duration,
+            prompt_context={
+                "title": title,
+                "channel": channel,
+                "captions": prompt_context,
+            },
+        )
         logger.info(
             "[CELERY] AssemblyAI returned %d segments in %.1fs for %s",
             len(stt_segments) if stt_segments else 0,
@@ -119,6 +132,11 @@ def run_stt_pipeline(
                 )
             )
             db.commit()
+        publish_video_event_sync(
+            "video.transcription_ready",
+            video_db_id,
+            {"transcription_status": "ready", "level": level},
+        )
 
         elapsed = time.time() - pipeline_t0
         logger.info(
@@ -134,6 +152,17 @@ def run_stt_pipeline(
             "segments": len(stt_segments),
             "level": level,
         }
+
+    except VideoUnavailableError as exc:
+        elapsed = time.time() - pipeline_t0
+        logger.warning(
+            "[CELERY] ✘ Video unavailable for %s after %.1fs (permanent, no retry): %s",
+            youtube_id,
+            elapsed,
+            exc,
+        )
+        _mark_failed(video_db_id, str(exc))
+        return {"status": "failed", "video_id": video_db_id, "reason": "video_unavailable"}
 
     except Exception as exc:
         elapsed = time.time() - pipeline_t0
@@ -164,4 +193,9 @@ def _mark_failed(video_db_id: str, error_msg: str):
             )
         )
         db.commit()
+    publish_video_event_sync(
+        "video.transcription_failed",
+        video_db_id,
+        {"transcription_status": "failed"},
+    )
     logger.info("[CELERY] Status → failed for %s: %s", video_db_id, error_msg[:100])

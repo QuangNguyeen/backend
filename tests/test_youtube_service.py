@@ -164,6 +164,16 @@ class TestMergeSegmentsSmart:
         assert merged[1].text == "How are you?"
         assert merged[2].text == "I am fine."
 
+    def test_preserves_gap_after_sentence_boundary(self):
+        segs = [
+            _seg("Hello world from AssemblyAI.", 0.0, 2.5),
+            _seg("Next sentence starts now.", 2.6, 2.5),
+        ]
+        merged = merge_segments_smart(segs, max_duration=10.0, min_duration=2.0)
+        assert len(merged) == 2
+        assert merged[0].end == pytest.approx(2.5)
+        assert merged[1].start == pytest.approx(2.6)
+
     def test_merges_until_sentence_end(self):
         """Segments without punctuation should accumulate until one with punctuation."""
         segs = [
