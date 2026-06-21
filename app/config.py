@@ -1,9 +1,10 @@
 import json
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import field_validator, model_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, NoDecode
 
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
@@ -29,8 +30,10 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
-    # CORS
-    CORS_ORIGINS: list[str] = [
+    # CORS — NoDecode disables pydantic-settings' automatic JSON decoding so the
+    # validator below receives the raw env string and can accept both a JSON list
+    # and a comma-separated string.
+    CORS_ORIGINS: Annotated[list[str], NoDecode] = [
         "http://localhost:5173",
         "http://localhost:5174",
         "http://localhost:3000",
