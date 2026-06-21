@@ -15,6 +15,10 @@ STT_MAX_DURATION_SECONDS = 600
 _YOUTUBE_URL = "https://www.youtube.com/watch?v={video_id}"
 _NATIVE_AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio[acodec^=opus]/bestaudio/best"
 
+# YouTube blocks datacenter IPs ("Sign in to confirm you're not a bot") unless
+# authenticated cookies are supplied. Mounted at /app/cookies.txt in the worker.
+_COOKIE_PATH = Path(__file__).resolve().parent.parent.parent / "cookies.txt"
+
 
 class VideoUnavailableError(Exception):
     """Raised when YouTube refuses to serve a video.
@@ -70,6 +74,8 @@ def _yt_dlp_options(**overrides):
         "format": _NATIVE_AUDIO_FORMAT,
         "noplaylist": True,
     }
+    if _COOKIE_PATH.exists():
+        opts["cookiefile"] = str(_COOKIE_PATH)
     opts.update(overrides)
     return opts
 
@@ -174,8 +180,10 @@ def extract_wav_audio(video_id: str, out_dir: Path) -> AudioFile:
         "ffmpeg:-ac 1 -ar 16000",
         "-o",
         str(wav_path),
-        _youtube_url(video_id),
     ]
+    if _COOKIE_PATH.exists():
+        cmd += ["--cookies", str(_COOKIE_PATH)]
+    cmd.append(_youtube_url(video_id))
 
     logger.info("[STT] Extracting WAV fallback for %s -> %s", video_id, wav_path)
     t0 = time.time()
