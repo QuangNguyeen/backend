@@ -763,7 +763,16 @@ def _get_metadata_ytdlp(video_id: str) -> dict | None:
         "no_warnings": True,
         "skip_download": True,
         "no_color": True,
+        # Same datacenter-IP workarounds as the other yt-dlp calls, otherwise
+        # this raises "Sign in to confirm you're not a bot" and duration is lost.
+        "remote_components": ["ejs:github"],
     }
+    cookie_file = _writable_cookie_file()
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
+    proxy = _proxy_url()
+    if proxy:
+        ydl_opts["proxy"] = proxy
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
