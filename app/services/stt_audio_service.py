@@ -1,7 +1,9 @@
 """Shared helpers for YouTube audio used by STT providers."""
 
 import logging
+import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +20,21 @@ _NATIVE_AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio[acodec^=opus]/bestaudio/bes
 # YouTube blocks datacenter IPs ("Sign in to confirm you're not a bot") unless
 # authenticated cookies are supplied. Mounted at /app/cookies.txt in the worker.
 _COOKIE_PATH = Path(__file__).resolve().parent.parent.parent / "cookies.txt"
+
+
+def _writable_cookie_file() -> str | None:
+    """Return a writable copy of the cookies file, or None if none exists.
+
+    The mounted cookies.txt is read-only, but yt-dlp rewrites the cookie jar on
+    close to persist refreshed session cookies — writing to the read-only mount
+    raises OSError(Errno 30). Copy it to a writable temp path so yt-dlp can read
+    and rewrite freely; the mounted file stays the source of truth.
+    """
+    if not _COOKIE_PATH.exists():
+        return None
+    dst = Path(tempfile.gettempdir()) / "yt-cookies.txt"
+    shutil.copy2(_COOKIE_PATH, dst)
+    return str(dst)
 
 
 class VideoUnavailableError(Exception):
@@ -74,8 +91,9 @@ def _yt_dlp_options(**overrides):
         "format": _NATIVE_AUDIO_FORMAT,
         "noplaylist": True,
     }
-    if _COOKIE_PATH.exists():
-        opts["cookiefile"] = str(_COOKIE_PATH)
+    cookie_file = _writable_cookie_file()
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
     opts.update(overrides)
     return opts
 
@@ -181,8 +199,9 @@ def extract_wav_audio(video_id: str, out_dir: Path) -> AudioFile:
         "-o",
         str(wav_path),
     ]
-    if _COOKIE_PATH.exists():
-        cmd += ["--cookies", str(_COOKIE_PATH)]
+    cookie_file = _writable_cookie_file()
+    if cookie_file:
+        cmd += ["--cookies", cookie_file]
     cmd.append(_youtube_url(video_id))
 
     logger.info("[STT] Extracting WAV fallback for %s -> %s", video_id, wav_path)
