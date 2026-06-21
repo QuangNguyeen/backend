@@ -1,6 +1,8 @@
 import html
 import logging
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
@@ -33,6 +35,19 @@ def _create_api() -> YouTubeTranscriptApi:
 
 
 _ytt_api = _create_api()
+
+
+def _writable_cookie_file() -> str | None:
+    """Return a throwaway writable copy of the cookies file, or None if absent.
+
+    yt-dlp rewrites the cookie jar on close; the mounted cookies file is
+    read-only, so copy it to /tmp (also avoids OSError on the read-only mount).
+    """
+    if not _cookie_path.exists():
+        return None
+    dst = Path(tempfile.gettempdir()) / "yt-cookies-subs.txt"
+    shutil.copy2(_cookie_path, dst)
+    return str(dst)
 
 
 @dataclass
@@ -248,7 +263,14 @@ def get_transcript_ytdlp(video_id: str, languages: list[str] | None = None) -> T
         "subtitleslangs": languages,
         "subtitlesformat": "json3",
         "no_color": True,
+        # Cookies + EJS solver are required from datacenter IPs; without them
+        # YouTube returns "Sign in to confirm you're not a bot" and no subtitles,
+        # forcing an avoidable AssemblyAI STT call for caption-bearing videos.
+        "remote_components": ["ejs:github"],
     }
+    cookie_file = _writable_cookie_file()
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)

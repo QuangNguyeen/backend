@@ -27,6 +27,11 @@ services:
       timeout: 5s
       retries: 5
     expose: ["8000"]
+    volumes:
+      # Import (Layer 1/2 transcript fetch) runs in web and needs the cookies to
+      # pull captions from YouTube on a datacenter IP. Read-only; yt-dlp uses a
+      # /tmp copy (see _writable_cookie_file).
+      - ./secrets/cookies.txt:/app/cookies.txt:ro
 
   worker:
     image: ghcr.io/${GHCR_OWNER}/dictalearn-backend:${IMAGE_TAG:-latest}
