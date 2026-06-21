@@ -98,6 +98,10 @@ def _yt_dlp_options(**overrides):
         "no_color": True,
         "format": _NATIVE_AUDIO_FORMAT,
         "noplaylist": True,
+        # Let yt-dlp fetch the EJS solver script so Deno can solve YouTube's "n"
+        # challenge — without it only storyboard images are exposed and audio
+        # extraction fails with "Requested format is not available".
+        "remote_components": ["ejs:github"],
     }
     cookie_file = _writable_cookie_file()
     if cookie_file:
@@ -199,6 +203,10 @@ def extract_wav_audio(video_id: str, out_dir: Path) -> AudioFile:
         "yt-dlp",
         "--quiet",
         "--no-warnings",
+        # Fetch the EJS solver so Deno can solve YouTube's "n" challenge (see
+        # _yt_dlp_options); otherwise no downloadable audio formats are exposed.
+        "--remote-components",
+        "ejs:github",
         "-x",
         "--audio-format",
         "wav",
