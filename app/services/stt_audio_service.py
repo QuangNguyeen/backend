@@ -1,6 +1,7 @@
 """Shared helpers for YouTube audio used by STT providers."""
 
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -32,6 +33,13 @@ def _writable_cookie_file() -> str | None:
     """
     if not _COOKIE_PATH.exists():
         return None
+    # If the mounted cookie file is writable, use it directly so yt-dlp persists
+    # YouTube's rotated session cookies back to it — keeping the session alive
+    # across runs. (Mount it read-write in compose for this to take effect.)
+    if os.access(_COOKIE_PATH, os.W_OK):
+        return str(_COOKIE_PATH)
+    # Read-only mount: copy to a writable temp path so yt-dlp's cookie-jar rewrite
+    # on close doesn't raise OSError(Errno 30). Rotations won't persist here.
     dst = Path(tempfile.gettempdir()) / "yt-cookies.txt"
     shutil.copy2(_COOKIE_PATH, dst)
     return str(dst)

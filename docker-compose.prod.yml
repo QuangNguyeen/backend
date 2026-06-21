@@ -41,7 +41,9 @@ services:
       --loglevel=info --pool=prefork --concurrency=2 --max-tasks-per-child=20
     mem_limit: 4g
     volumes:
-      - ./secrets/cookies.txt:/app/cookies.txt:ro
+      # Writable (no :ro) so yt-dlp can persist YouTube's rotated session
+      # cookies back to the file, keeping the login session alive longer.
+      - ./secrets/cookies.txt:/app/cookies.txt
       - ./secrets/gcp-credentials.json:/app/gcp-credentials.json:ro
     depends_on:
       db: { condition: service_healthy }

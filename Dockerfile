@@ -4,10 +4,17 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# System deps: ffmpeg (yt-dlp audio extraction), build/pg headers, curl (healthcheck)
+# System deps: ffmpeg (yt-dlp audio extraction), build/pg headers, curl
+# (healthcheck), unzip (Deno installer).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg build-essential libpq-dev curl \
+        ffmpeg build-essential libpq-dev curl unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Deno — JS runtime yt-dlp needs to solve YouTube's JS challenges and expose all
+# formats. Without it yt-dlp warns "No supported JavaScript runtime" and fails
+# with "Requested format is not available". Installed system-wide for appuser.
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
+    && deno --version
 
 WORKDIR /app
 

@@ -25,7 +25,7 @@ requests==2.32.5
 
 # YouTube
 youtube-transcript-api==1.2.4
-yt-dlp==2026.3.17
+yt-dlp==2026.6.9
 
 # NLP / text analysis
 spacy==3.8.13
