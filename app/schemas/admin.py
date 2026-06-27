@@ -172,3 +172,59 @@ class AdminRecentActivity(BaseModel):
 
 class AdminRecentActivityResponse(BaseModel):
     activities: list[AdminRecentActivity]
+
+
+# ── Per-user analytics detail ────────────────────────────────────────────────
+
+
+class AdminUserStudyPoint(BaseModel):
+    date: str
+    study_minutes: float
+    sessions: int
+
+
+class AdminUserVocabProgress(BaseModel):
+    total: int
+    new: int
+    learning: int
+    mastered: int
+    due: int
+    saved_in_range: int
+
+
+class AdminUserAnalyticsResponse(BaseModel):
+    user_id: str
+    display_name: str
+    email: str
+    time_range: str
+    total_study_minutes: float
+    total_sessions: int
+    avg_accuracy: float
+    current_streak: int
+    longest_streak: int
+    total_vocabulary: int
+    study_chart: list[AdminUserStudyPoint]
+    vocabulary: AdminUserVocabProgress
+
+
+class AdminUserSessionItem(BaseModel):
+    attempt_id: str
+    video_id: str
+    video_title: str | None
+    status: str
+    practice_mode: str
+    score: float | None
+    duration_seconds: int | None
+    total_words: int | None
+    correct_words: int | None
+    total_sentences: int | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+
+
+class AdminUserSessionHistoryResponse(BaseModel):
+    items: list[AdminUserSessionItem]
+    total: int
+    page: int
+    total_pages: int

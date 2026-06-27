@@ -12,6 +12,8 @@ from app.schemas.admin import (
     AdminStudyHoursResponse,
     AdminTopLearnersResponse,
     AdminTrafficResponse,
+    AdminUserAnalyticsResponse,
+    AdminUserSessionHistoryResponse,
 )
 from app.services.admin_analytics_service import AdminAnalyticsService
 
@@ -74,3 +76,26 @@ async def get_admin_recent_activity(
     service: AdminAnalyticsService = Depends(get_admin_analytics_service),
 ):
     return await service.get_recent_activity(limit)
+
+
+@router.get("/users/{user_id}", response_model=AdminUserAnalyticsResponse)
+async def get_admin_user_analytics(
+    user_id: str,
+    time_range: str = Query("30d", pattern="^(1d|7d|30d|90d)$"),
+    _current_admin: User = Depends(get_admin_user),
+    service: AdminAnalyticsService = Depends(get_admin_analytics_service),
+):
+    return await service.get_user_analytics(user_id, time_range)
+
+
+@router.get(
+    "/users/{user_id}/sessions", response_model=AdminUserSessionHistoryResponse
+)
+async def get_admin_user_session_history(
+    user_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    _current_admin: User = Depends(get_admin_user),
+    service: AdminAnalyticsService = Depends(get_admin_analytics_service),
+):
+    return await service.get_user_session_history(user_id, page, page_size)

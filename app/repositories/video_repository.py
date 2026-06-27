@@ -284,6 +284,26 @@ class VideoRepository:
         )
         return [(row[0], row[1]) for row in rows.all()]
 
+    async def list_user_practice_tags_for_videos(
+        self, user_id: str, video_ids: list[str]
+    ) -> list[tuple[str, TopicTag]]:
+        if not video_ids:
+            return []
+        rows = await self.db.execute(
+            select(UserPracticeVideo.video_id, TopicTag)
+            .join(
+                UserPracticeVideoTag,
+                UserPracticeVideoTag.practice_video_id == UserPracticeVideo.id,
+            )
+            .join(TopicTag, TopicTag.id == UserPracticeVideoTag.tag_id)
+            .where(
+                UserPracticeVideo.user_id == user_id,
+                UserPracticeVideo.video_id.in_(video_ids),
+            )
+            .order_by(TopicTag.sort_order, TopicTag.name)
+        )
+        return [(row[0], row[1]) for row in rows.all()]
+
     async def list_unattempted_practice_tags(
         self, user_id: str
     ) -> list[tuple[str, TopicTag]]:

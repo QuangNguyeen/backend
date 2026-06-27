@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # JWT
     SECRET_KEY: str = _INSECURE_SECRET_DEFAULT
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # CORS
@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
 
     # Google OAuth
+    # Accepts one or more client IDs (comma-separated): typically the web
+    # client ID plus the native iOS/Android client IDs. A Google ID token is
+    # valid if its audience matches any of these.
     GOOGLE_CLIENT_ID: str = ""
 
     # Celery / Redis
@@ -57,6 +60,11 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.ENVIRONMENT.strip().lower() in ("production", "prod")
+
+    @property
+    def google_client_ids(self) -> list[str]:
+        """All OAuth client IDs accepted as a valid Google ID-token audience."""
+        return [cid.strip() for cid in self.GOOGLE_CLIENT_ID.split(",") if cid.strip()]
 
     @property
     def celery_broker(self) -> str:

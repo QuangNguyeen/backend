@@ -219,6 +219,24 @@ class VideoService:
             raise NotFoundError("Video not found")
         return video
 
+    async def _public_tags_by_video(
+        self, video_ids: list[str]
+    ) -> dict[str, list[TopicTag]]:
+        tags_by_video: dict[str, list[TopicTag]] = defaultdict(list)
+        for video_id, tag in await self.repo.list_public_tags_for_videos(video_ids):
+            tags_by_video[video_id].append(tag)
+        return tags_by_video
+
+    async def _my_tags_by_video(
+        self, user_id: str, video_ids: list[str]
+    ) -> dict[str, list[TopicTag]]:
+        tags_by_video: dict[str, list[TopicTag]] = defaultdict(list)
+        for video_id, tag in await self.repo.list_user_practice_tags_for_videos(
+            user_id, video_ids
+        ):
+            tags_by_video[video_id].append(tag)
+        return tags_by_video
+
     async def _serialize_video(
         self,
         video: Video,
@@ -288,6 +306,9 @@ class VideoService:
         )
         total_pages = max(1, math.ceil(total / page_size))
 
+        video_ids = [row[0].id for row in rows]
+        public_tags_by_video = await self._public_tags_by_video(video_ids)
+
         videos = []
         for row in rows:
             video = row[0]
@@ -295,6 +316,7 @@ class VideoService:
                 video,
                 play_count=row[1] or 0,
                 best_score=row[2],
+                public_tags=public_tags_by_video.get(video.id, []),
             )
             videos.append(resp)
         return {"items": videos, "total": total, "page": page, "total_pages": total_pages}
@@ -323,6 +345,11 @@ class VideoService:
             page_size,
         )
         total_pages = max(1, math.ceil(total / page_size))
+
+        video_ids = [video.id for video, *_ in rows]
+        public_tags_by_video = await self._public_tags_by_video(video_ids)
+        my_tags_by_video = await self._my_tags_by_video(user.id, video_ids)
+
         videos = []
         for video, created_at, play_count, best_score in rows:
             videos.append(
@@ -332,6 +359,8 @@ class VideoService:
                     play_count=play_count or 0,
                     best_score=best_score,
                     my_practice_created_at=created_at,
+                    public_tags=public_tags_by_video.get(video.id, []),
+                    my_tags=my_tags_by_video.get(video.id, []),
                 )
             )
         return {"items": videos, "total": total, "page": page, "total_pages": total_pages}
