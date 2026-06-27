@@ -62,10 +62,20 @@ async def google_login(
         idinfo = google_id_token.verify_oauth2_token(
             body.id_token,
             google_requests.Request(),
-            settings.GOOGLE_CLIENT_ID,
+            # Audience is verified manually below so that tokens from any of our
+            # client IDs (web + native iOS/Android) are accepted.
+            audience=None,
+            # Tolerate small clock drift between Google, the device, and the
+            # server — otherwise mobile sign-ins intermittently fail with
+            # "Token used too early/late".
+            clock_skew_in_seconds=10,
         )
     except ValueError as e:
         raise UnauthorizedError(f"Invalid Google token: {e}")
+
+    # Accept the token only if its audience is one of our configured client IDs.
+    if idinfo.get("aud") not in settings.google_client_ids:
+        raise UnauthorizedError("Invalid Google token: unrecognized client ID")
 
     return await service.google_login(idinfo)
 

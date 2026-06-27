@@ -2,7 +2,7 @@
 
 from datetime import date
 
-from sqlalchemy import Date, cast, func, or_, select
+from sqlalchemy import Date, and_, case, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dictation import DictationAttempt
@@ -308,3 +308,161 @@ class AdminAnalyticsRepository:
                 .limit(limit)
             )
         ).all()
+
+    # ── Per-user analytics detail ────────────────────────────────────────────
+
+    async def get_user(self, user_id: str) -> User | None:
+        return (
+            await self.db.execute(select(User).where(User.id == user_id))
+        ).scalar_one_or_none()
+
+    async def user_attempt_summary(self, user_id: str, start: date):
+        return (
+            await self.db.execute(
+                select(
+                    func.coalesce(func.sum(DictationAttempt.duration_seconds), 0).label(
+                        "study_seconds"
+                    ),
+                    func.count(DictationAttempt.id).label("sessions"),
+                    func.coalesce(func.avg(DictationAttempt.score), 0).label("avg_accuracy"),
+                ).where(
+                    DictationAttempt.user_id == user_id,
+                    DictationAttempt.status == "completed",
+                    cast(DictationAttempt.updated_at, Date) >= start,
+                )
+            )
+        ).one()
+
+    async def user_active_dates(self, user_id: str) -> set[date]:
+        rows = (
+            await self.db.execute(
+                select(cast(DictationAttempt.updated_at, Date).label("day"))
+                .where(
+                    DictationAttempt.user_id == user_id,
+                    DictationAttempt.status == "completed",
+                )
+                .group_by("day")
+            )
+        ).all()
+        return {row.day for row in rows if row.day is not None}
+
+    async def user_study_seconds_by_hour(self, user_id: str, day: date) -> list:
+        return (
+            await self.db.execute(
+                select(
+                    func.extract("hour", DictationAttempt.updated_at).label("hour"),
+                    func.coalesce(func.sum(DictationAttempt.duration_seconds), 0).label(
+                        "total_seconds"
+                    ),
+                    func.count(DictationAttempt.id).label("sessions"),
+                )
+                .where(
+                    DictationAttempt.user_id == user_id,
+                    DictationAttempt.status == "completed",
+                    cast(DictationAttempt.updated_at, Date) == day,
+                )
+                .group_by("hour")
+            )
+        ).all()
+
+    async def user_study_seconds_by_day(self, user_id: str, start: date) -> list:
+        return (
+            await self.db.execute(
+                select(
+                    cast(DictationAttempt.updated_at, Date).label("day"),
+                    func.coalesce(func.sum(DictationAttempt.duration_seconds), 0).label(
+                        "total_seconds"
+                    ),
+                    func.count(DictationAttempt.id).label("sessions"),
+                )
+                .where(
+                    DictationAttempt.user_id == user_id,
+                    DictationAttempt.status == "completed",
+                    cast(DictationAttempt.updated_at, Date) >= start,
+                )
+                .group_by("day")
+            )
+        ).all()
+
+    async def user_vocab_progress(self, user_id: str, start: date):
+        reps = SavedWord.repetitions
+        return (
+            await self.db.execute(
+                select(
+                    func.count().label("total"),
+                    func.coalesce(
+                        func.sum(case((reps == 0, 1), else_=0)), 0
+                    ).label("new"),
+                    func.coalesce(
+                        func.sum(case((and_(reps >= 1, reps < 5), 1), else_=0)), 0
+                    ).label("learning"),
+                    func.coalesce(
+                        func.sum(case((reps >= 5, 1), else_=0)), 0
+                    ).label("mastered"),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    and_(
+                                        SavedWord.next_review_at.is_not(None),
+                                        SavedWord.next_review_at <= func.now(),
+                                    ),
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ).label("due"),
+                    func.coalesce(
+                        func.sum(
+                            case((cast(SavedWord.created_at, Date) >= start, 1), else_=0)
+                        ),
+                        0,
+                    ).label("saved_in_range"),
+                ).where(
+                    SavedWord.user_id == user_id,
+                    SavedWord.deleted_at.is_(None),
+                )
+            )
+        ).one()
+
+    async def user_total_vocab(self, user_id: str) -> int:
+        return await self._scalar(
+            select(func.count()).where(
+                SavedWord.user_id == user_id,
+                SavedWord.deleted_at.is_(None),
+            )
+        )
+
+    async def user_session_history(
+        self, user_id: str, page: int, page_size: int
+    ) -> tuple[list, int]:
+        total = await self._scalar(
+            select(func.count()).where(DictationAttempt.user_id == user_id)
+        )
+        rows = (
+            await self.db.execute(
+                select(
+                    DictationAttempt.id,
+                    DictationAttempt.video_id,
+                    Video.title,
+                    DictationAttempt.status,
+                    DictationAttempt.practice_mode,
+                    DictationAttempt.score,
+                    DictationAttempt.duration_seconds,
+                    DictationAttempt.total_words,
+                    DictationAttempt.correct_words,
+                    DictationAttempt.total_sentences,
+                    DictationAttempt.created_at,
+                    DictationAttempt.updated_at,
+                    DictationAttempt.completed_at,
+                )
+                .outerjoin(Video, DictationAttempt.video_id == Video.id)
+                .where(DictationAttempt.user_id == user_id)
+                .order_by(DictationAttempt.updated_at.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        ).all()
+        return rows, total

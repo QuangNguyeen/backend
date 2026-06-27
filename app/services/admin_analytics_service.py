@@ -1,7 +1,9 @@
 """Business logic for admin analytics dashboards."""
 
+import math
 from datetime import date, datetime, timedelta
 
+from app.core.exceptions import NotFoundError
 from app.repositories.admin_analytics_repository import AdminAnalyticsRepository
 from app.schemas.admin import (
     AdminContentHealthResponse,
@@ -14,7 +16,13 @@ from app.schemas.admin import (
     AdminTopLearnersResponse,
     AdminTrafficPoint,
     AdminTrafficResponse,
+    AdminUserAnalyticsResponse,
+    AdminUserSessionHistoryResponse,
+    AdminUserSessionItem,
+    AdminUserStudyPoint,
+    AdminUserVocabProgress,
 )
+from app.services.stats_service import compute_streaks
 
 TIME_RANGE_DAYS = {"1d": 1, "7d": 7, "30d": 30, "90d": 90}
 
@@ -289,3 +297,108 @@ class AdminAnalyticsService:
 
         activities.sort(key=lambda item: item.timestamp, reverse=True)
         return AdminRecentActivityResponse(activities=activities[:limit])
+
+    # ── Per-user analytics detail ────────────────────────────────────────────
+
+    async def _user_study_chart(
+        self, user_id: str, time_range: str
+    ) -> list[AdminUserStudyPoint]:
+        today = date.today()
+
+        if time_range == "1d":
+            rows = await self.repo.user_study_seconds_by_hour(user_id, today)
+            by_hour = {
+                int(row.hour): row for row in rows if row.hour is not None
+            }
+            return [
+                AdminUserStudyPoint(
+                    date=_hour_point_date(today, hour),
+                    study_minutes=round(
+                        float(getattr(by_hour.get(hour), "total_seconds", 0) or 0) / 60, 1
+                    ),
+                    sessions=int(getattr(by_hour.get(hour), "sessions", 0) or 0),
+                )
+                for hour in _hour_series_for_today()
+            ]
+
+        start = _range_start(time_range)
+        rows = await self.repo.user_study_seconds_by_day(user_id, start)
+        by_day = {row.day: row for row in rows if row.day}
+        return [
+            AdminUserStudyPoint(
+                date=day.isoformat(),
+                study_minutes=round(
+                    float(getattr(by_day.get(day), "total_seconds", 0) or 0) / 60, 1
+                ),
+                sessions=int(getattr(by_day.get(day), "sessions", 0) or 0),
+            )
+            for day in _day_series(start, today)
+        ]
+
+    async def get_user_analytics(
+        self, user_id: str, time_range: str
+    ) -> AdminUserAnalyticsResponse:
+        user = await self.repo.get_user(user_id)
+        if user is None:
+            raise NotFoundError("User not found")
+
+        start = _range_start(time_range)
+        summary = await self.repo.user_attempt_summary(user_id, start)
+        active_dates = await self.repo.user_active_dates(user_id)
+        current_streak, longest_streak = compute_streaks(active_dates, date.today())
+        study_chart = await self._user_study_chart(user_id, time_range)
+
+        vocab = await self.repo.user_vocab_progress(user_id, start)
+
+        return AdminUserAnalyticsResponse(
+            user_id=user.id,
+            display_name=user.display_name,
+            email=user.email,
+            time_range=time_range,
+            total_study_minutes=round(float(summary.study_seconds or 0) / 60, 1),
+            total_sessions=int(summary.sessions or 0),
+            avg_accuracy=round(float(summary.avg_accuracy or 0) * 100, 1),
+            current_streak=current_streak,
+            longest_streak=longest_streak,
+            total_vocabulary=int(vocab.total or 0),
+            study_chart=study_chart,
+            vocabulary=AdminUserVocabProgress(
+                total=int(vocab.total or 0),
+                new=int(vocab.new or 0),
+                learning=int(vocab.learning or 0),
+                mastered=int(vocab.mastered or 0),
+                due=int(vocab.due or 0),
+                saved_in_range=int(vocab.saved_in_range or 0),
+            ),
+        )
+
+    async def get_user_session_history(
+        self, user_id: str, page: int, page_size: int
+    ) -> AdminUserSessionHistoryResponse:
+        user = await self.repo.get_user(user_id)
+        if user is None:
+            raise NotFoundError("User not found")
+
+        rows, total = await self.repo.user_session_history(user_id, page, page_size)
+        total_pages = max(1, math.ceil(total / page_size))
+        items = [
+            AdminUserSessionItem(
+                attempt_id=row.id,
+                video_id=row.video_id,
+                video_title=row.title,
+                status=row.status,
+                practice_mode=row.practice_mode,
+                score=round(float(row.score) * 100, 1) if row.score is not None else None,
+                duration_seconds=row.duration_seconds,
+                total_words=row.total_words,
+                correct_words=row.correct_words,
+                total_sentences=row.total_sentences,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+                completed_at=row.completed_at,
+            )
+            for row in rows
+        ]
+        return AdminUserSessionHistoryResponse(
+            items=items, total=total, page=page, total_pages=total_pages
+        )
