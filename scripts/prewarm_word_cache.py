@@ -32,10 +32,12 @@ log = logging.getLogger("prewarm")
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY = os.environ.get(
-    "GEMINI_API_KEY",
-    "AIzaSyCpr-Ab98fnhlet0V5AwZbOyVWYJxqxGB4",
-)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise SystemExit(
+        "GEMINI_API_KEY is not set. Export it (e.g. from your .env) before running "
+        "this script — do not hardcode API keys in source."
+    )
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}"
